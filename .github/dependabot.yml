@@ -9,7 +9,6 @@ updates:
       time: "09:00"
       timezone: America/Chicago
     open-pull-requests-limit: 5
-
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -18,4 +17,3 @@ updates:
       time: "09:15"
       timezone: America/Chicago
     open-pull-requests-limit: 5
-
