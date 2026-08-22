@@ -156,8 +156,10 @@ jobs:
       - name: Install SQLite and Python (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install sqlite python@3.13
-          echo "$(brew --prefix python@3.13)/bin" >> "$GITHUB_PATH"
+          brew install sqlite
+          brew install python@3.13 || \
+            test -x "$(brew --prefix python@3.13)/bin/python3.13"
+          echo "$(brew --prefix python@3.13)/libexec/bin" >> "$GITHUB_PATH"
 
       - name: Install SQLite (Windows)
         if: runner.os == 'Windows'
