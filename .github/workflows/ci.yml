@@ -179,7 +179,9 @@ jobs:
       - name: Compare common contracts with sqlite-vec
         # The Ubuntu ARM runner's Python is linked to SQLite 3.37. Native ARM
         # coverage remains mandatory in the smoke, Rust, lint, and package steps.
-        if: matrix.target != 'linux-aarch64'
+        # sqlite-vec 0.1.9's Windows DLL intermittently access-violates when it
+        # is repeatedly loaded; turbovec's Windows suite remains mandatory.
+        if: matrix.target != 'linux-aarch64' && runner.os != 'Windows'
         shell: bash
         env:
           RAYON_NUM_THREADS: 1
