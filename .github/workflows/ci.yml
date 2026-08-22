@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite-compatibility:
+    name: SQLite 3.44 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build SQLite 3.44.0 from the official amalgamation
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLO \
+            https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip
+          unzip -q sqlite-amalgamation-3440000.zip
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          source = Path("sqlite-amalgamation-3440000/sqlite3.c").read_bytes()
+          expected = "d9e6530096136067644b1cb2057b3b0fa51070df99ec61971f73c9ba6aa9a36e"
+          assert hashlib.sha3_256(source).hexdigest() == expected
+          PY
+          cc -O2 \
+            sqlite-amalgamation-3440000/shell.c \
+            sqlite-amalgamation-3440000/sqlite3.c \
+            -ldl -lpthread -o sqlite3-compat
+
+      - name: Run smoke suite on supported baseline
+        env:
+          SQLITE3: ${{ github.workspace }}/sqlite3-compat
+        run: ./scripts/test.sh
+
+  build-and-smoke:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: linux-aarch64
+          - os: macos-14
+            target: macos-aarch64
+          - os: macos-15-intel
+            target: macos-x86_64
+          - os: windows-latest
+            target: windows-x86_64
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install SQLite 3.44 (Ubuntu)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSLO \
+            https://www.sqlite.org/2023/sqlite-amalgamation-3440000.zip
+          unzip -q sqlite-amalgamation-3440000.zip
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          source = Path("sqlite-amalgamation-3440000/sqlite3.c").read_bytes()
+          expected = "d9e6530096136067644b1cb2057b3b0fa51070df99ec61971f73c9ba6aa9a36e"
+          assert hashlib.sha3_256(source).hexdigest() == expected
+          PY
+          cc -O2 \
+            sqlite-amalgamation-3440000/shell.c \
+            sqlite-amalgamation-3440000/sqlite3.c \
+            -ldl -lpthread -o sqlite3-ci
+          echo "SQLITE3=$GITHUB_WORKSPACE/sqlite3-ci" >> "$GITHUB_ENV"
+
+      - name: Install SQLite (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite
+
+      - name: Install SQLite (Windows)
+        if: runner.os == 'Windows'
+        run: choco install sqlite -y
+
+      - name: Test extension
+        shell: bash
+        run: ./scripts/test.sh
+
+      - name: Compare common contracts with sqlite-vec
+        # The Ubuntu ARM image's Python sqlite3 module is linked to SQLite 3.37,
+        # below this extension's 3.44 minimum. Native ARM coverage remains in
+        # the smoke, lint, and package steps in this job.
+        if: matrix.target != 'linux-aarch64'
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: 1
+        run: |
+          ./scripts/compare_sqlite_vec.sh \
+            --rows 512 \
+            --dimensions 64 \
+            --queries 12 \
+            --k 10 \
+            --repetitions 1 \
+            --warmup 2
+
+      - name: Lint extension
+        shell: bash
+        run: cargo clippy --all-targets --locked --no-deps -- -D warnings
+
+      - name: Check formatting
+        shell: bash
+        run: cargo fmt --check
+
+      - name: Package extension
+        shell: bash
+        run: ./scripts/package.sh
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: turbovec-sqlite-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  client-examples:
+    name: Python, JavaScript, and Go clients
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.26.x"
+          cache-dependency-path: examples/clients/go/go.sum
+
+      - name: Run host-language examples
+        run: ./scripts/test_clients.sh
+
+  release:
+    name: Publish tagged archives
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [sqlite-compatibility, build-and-smoke, client-examples]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches crate version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/*.tar.gz \
+            release-assets/*.sha256 \
+            --generate-notes \
+            --title "turbovec-sqlite $GITHUB_REF_NAME"

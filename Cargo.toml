@@ -1,0 +1,27 @@
+[package]
+name = "turbovec-sqlite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Experimental TurboVec loadable extension for SQLite"
+license = "MIT"
+repository = "https://github.com/bryanhelmig/turbovec-sqlite"
+readme = "README.md"
+keywords = ["sqlite", "vector-search", "extension", "embeddings"]
+categories = ["database", "database-implementations"]
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The virtual-table module fills callbacks that Rusqlite 0.40 does not expose.
+# Pin the audited layout until those callbacks are available in its safe API.
+rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", "functions", "loadable_extension", "vtab"] }
+serde_json = "1"
+# Pin the vector engine so an upstream format or API change requires an
+# explicit compatibility review in this extension.
+turbovec = "=1.0.0"
+
+[dev-dependencies]
+rayon = "1.12"
