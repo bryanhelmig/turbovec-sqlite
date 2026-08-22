@@ -422,3 +422,40 @@ pub unsafe extern "C" fn sqlite3_turbovec_init(
 ) -> c_int {
     unsafe { sqlite3_extension_init(db, error_message, api) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_json_and_little_endian_blob_vectors() {
+        let expected = vec![1.25, -2.5, 0.0];
+        assert_eq!(
+            parse_vector(ValueRef::Text(br#"[1.25, -2.5, 0.0]"#)).unwrap(),
+            expected
+        );
+
+        let blob = vector_blob(&expected);
+        assert_eq!(parse_vector(ValueRef::Blob(&blob)).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_invalid_vector_encodings_and_coordinates() {
+        assert!(parse_vector(ValueRef::Blob(&[0, 1, 2])).is_err());
+        assert!(parse_vector(ValueRef::Integer(1)).is_err());
+
+        let non_finite = vector_blob(&[f32::INFINITY]);
+        assert!(parse_vector(ValueRef::Blob(&non_finite)).is_err());
+
+        let oversized = vector_blob(&[1.0e16]);
+        assert!(parse_vector(ValueRef::Blob(&oversized)).is_err());
+    }
+
+    #[test]
+    fn rejects_negative_sizes_and_ids() {
+        assert!(checked_usize(-1, "dimensions").is_err());
+        assert!(checked_id(-1).is_err());
+        assert_eq!(checked_usize(8, "dimensions").unwrap(), 8);
+        assert_eq!(checked_id(42).unwrap(), 42);
+    }
+}

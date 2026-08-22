@@ -40,8 +40,29 @@ tar -czf "$archive" -C "$stage" "$package"
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$repo_root/dist" && sha256sum "$(basename "$archive")") > "$checksum"
+  (cd "$repo_root/dist" && sha256sum -c "$(basename "$checksum")")
 else
   (cd "$repo_root/dist" && shasum -a 256 "$(basename "$archive")") > "$checksum"
+  (cd "$repo_root/dist" && shasum -a 256 -c "$(basename "$checksum")")
 fi
+
+tar -tzf "$archive" > "$stage/archive-contents.txt"
+for required in \
+  "$library" \
+  README.md \
+  DESIGN.md \
+  BENCHMARKS.md \
+  PERFORMANCE_EXPERIMENTS.md \
+  demo.sql \
+  LICENSE \
+  examples/clients/python.py \
+  examples/clients/javascript.mjs \
+  examples/clients/go/main.go
+do
+  grep -Fqx "$package/$required" "$stage/archive-contents.txt" || {
+    echo "Package archive is missing $required" >&2
+    exit 1
+  }
+done
 
 printf '%s\n%s\n' "$archive" "$checksum"

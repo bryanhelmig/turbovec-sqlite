@@ -129,6 +129,12 @@ conflict policies, WAL readers, rename, defensive mode, integrity checks,
 randomized transaction model checks, cross-language loading, and comparison
 with pinned `sqlite-vec` 0.1.9 and an exact-search oracle.
 
+CI runs the native Rust tests on the declared Rust 1.89 minimum and checks the
+current stable toolchain. The extension suite, client examples, strict Clippy,
+and release packaging run across Linux, macOS, and Windows on x86-64 and ARM64.
+Python is pinned in CI so SQLite-bound transaction tests cannot be silently
+skipped. Dependabot and a weekly RustSec audit monitor locked dependencies.
+
 ## Package
 
 ```sh

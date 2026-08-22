@@ -995,3 +995,35 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
         i64::try_from(*id).map_err(|_| error("TurboVec id is too large for a SQLite rowid"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_virtual_table_geometry() {
+        let args: [&[u8]; 2] = [b"dimensions=768", b"bit_width=4"];
+        assert_eq!(parse_geometry(&args).unwrap(), (768, 4));
+
+        let missing: [&[u8]; 1] = [b"dimensions=768"];
+        assert!(parse_geometry(&missing).is_err());
+
+        let duplicate: [&[u8]; 3] = [b"dimensions=768", b"dimensions=384", b"bit_width=4"];
+        assert!(parse_geometry(&duplicate).is_err());
+
+        let unknown: [&[u8]; 3] = [b"dimensions=768", b"bit_width=4", b"metric=cosine"];
+        assert!(parse_geometry(&unknown).is_err());
+    }
+
+    #[test]
+    fn quotes_shadow_table_names() {
+        assert_eq!(quote("a\"b"), "\"a\"\"b\"");
+        assert_eq!(
+            names_str("main", "document_vectors"),
+            (
+                "\"main\".\"document_vectors_meta\"".to_owned(),
+                "\"main\".\"document_vectors_chunks\"".to_owned(),
+            )
+        );
+    }
+}

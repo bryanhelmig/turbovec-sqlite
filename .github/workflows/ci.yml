@@ -5,18 +5,76 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONFAULTHANDLER: "1"
+  RUST_BACKTRACE: "1"
+  RUST_VERSION: "1.89.0"
+
 jobs:
-  sqlite-compatibility:
-    name: SQLite 3.44 compatibility
+  quality:
+    name: Rust, scripts, and documentation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install declared Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt --no-self-update
+
+      - name: Install current stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint Rust
+        run: cargo clippy --all-targets --locked --no-deps -- -D warnings
+
+      - name: Run Rust tests on the minimum supported toolchain
+        run: |
+          cargo test --all-targets --locked
+          cargo test --doc --locked
+
+      - name: Check current stable Rust compatibility
+        run: cargo +stable check --all-targets --locked
+
+      - name: Treat documentation warnings as errors
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
+
+      - name: Check shell and Python sources
+        run: |
+          shellcheck scripts/*.sh
+          python3 -m compileall -q benchmarks examples scripts tests
+
+  sqlite-compatibility:
+    name: SQLite 3.44 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install declared Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt --no-self-update
 
       - name: Build SQLite 3.44.0 from the official amalgamation
         shell: bash
@@ -38,12 +96,14 @@ jobs:
 
       - name: Run smoke suite on supported baseline
         env:
+          REQUIRE_PYTHON_TESTS: "1"
           SQLITE3: ${{ github.workspace }}/sqlite3-compat
         run: ./scripts/test.sh
 
   build-and-smoke:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -63,6 +123,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install declared Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt --no-self-update
 
       - name: Install SQLite 3.44 (Ubuntu)
         if: runner.os == 'Linux'
@@ -94,13 +162,16 @@ jobs:
 
       - name: Test extension
         shell: bash
+        env:
+          REQUIRE_PYTHON_TESTS: "1"
+          TRANSACTION_TEST_REPETITIONS: ${{ runner.os == 'Windows' && '5' || '1' }}
         run: ./scripts/test.sh
 
+      - name: Run native Rust tests
+        shell: bash
+        run: cargo test --all-targets --locked
+
       - name: Compare common contracts with sqlite-vec
-        # The Ubuntu ARM image's Python sqlite3 module is linked to SQLite 3.37,
-        # below this extension's 3.44 minimum. Native ARM coverage remains in
-        # the smoke, lint, and package steps in this job.
-        if: matrix.target != 'linux-aarch64'
         shell: bash
         env:
           RAYON_NUM_THREADS: 1
@@ -117,10 +188,6 @@ jobs:
         shell: bash
         run: cargo clippy --all-targets --locked --no-deps -- -D warnings
 
-      - name: Check formatting
-        shell: bash
-        run: cargo fmt --check
-
       - name: Package extension
         shell: bash
         run: ./scripts/package.sh
@@ -136,10 +203,15 @@ jobs:
   client-examples:
     name: Python, JavaScript, and Go clients
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -150,14 +222,24 @@ jobs:
           go-version: "1.26.x"
           cache-dependency-path: examples/clients/go/go.sum
 
+      - name: Install declared Rust toolchain
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt --no-self-update
+
+      - name: Check client sources
+        run: |
+          node --check examples/clients/javascript.mjs
+          test -z "$(gofmt -l examples/clients/go)"
+          (cd examples/clients/go && go test ./... && go vet ./...)
+
       - name: Run host-language examples
         run: ./scripts/test_clients.sh
 
   release:
     name: Publish tagged archives
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [sqlite-compatibility, build-and-smoke, client-examples]
+    needs: [quality, sqlite-compatibility, build-and-smoke, client-examples]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -184,4 +266,5 @@ jobs:
             release-assets/*.tar.gz \
             release-assets/*.sha256 \
             --generate-notes \
+            --verify-tag \
             --title "turbovec-sqlite $GITHUB_REF_NAME"

@@ -65,13 +65,24 @@ import sqlite3
 raise SystemExit(sqlite3.sqlite_version_info < (3, 44, 0))
 PY
 then
-  python3 tests/multiconnection.py \
+  python3 -X faulthandler tests/multiconnection.py \
     "$test_dir/multiconnection.db" \
     "$extension"
-  python3 tests/transactions.py "$extension"
-  python3 tests/model_check.py "$extension" --seeds 20 --steps 20
+  transaction_repetitions=${TRANSACTION_TEST_REPETITIONS:-1}
+  if ! [[ "$transaction_repetitions" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TRANSACTION_TEST_REPETITIONS must be a positive integer" >&2
+    exit 1
+  fi
+  for ((run = 1; run <= transaction_repetitions; run++)); do
+    python3 -X faulthandler tests/transactions.py "$extension"
+  done
+  python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
 else
   python_sqlite_version=$(python3 -c 'import sqlite3; print(sqlite3.sqlite_version)')
+  if [[ "${REQUIRE_PYTHON_TESTS:-0}" == "1" ]]; then
+    echo "Python uses unsupported SQLite $python_sqlite_version; Python tests are required" >&2
+    exit 1
+  fi
   echo "Skipping Python-bound tests: Python uses unsupported SQLite $python_sqlite_version"
 fi
 
