@@ -133,7 +133,9 @@ CI runs the native Rust tests on the declared Rust 1.89 minimum and checks the
 current stable toolchain. The extension suite, client examples, strict Clippy,
 and release packaging run across Linux, macOS, and Windows on x86-64 and ARM64.
 Python is pinned in CI so SQLite-bound transaction tests cannot be silently
-skipped. Dependabot and a weekly RustSec audit monitor locked dependencies.
+skipped on supported runners; Ubuntu ARM is explicitly native-only because its
+Python is linked to SQLite 3.37. Dependabot and a weekly RustSec audit monitor
+locked dependencies.
 
 ## Package
 

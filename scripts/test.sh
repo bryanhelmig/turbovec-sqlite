@@ -62,7 +62,11 @@ chunked_rows=$(
 
 if python3 - <<'PY'
 import sqlite3
-raise SystemExit(sqlite3.sqlite_version_info < (3, 44, 0))
+supported = (
+    sqlite3.sqlite_version_info >= (3, 44, 0)
+    and hasattr(sqlite3.Connection, "enable_load_extension")
+)
+raise SystemExit(not supported)
 PY
 then
   python3 -X faulthandler tests/multiconnection.py \
@@ -79,11 +83,16 @@ then
   python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
 else
   python_sqlite_version=$(python3 -c 'import sqlite3; print(sqlite3.sqlite_version)')
+  python_extension_loading=$(python3 - <<'PY'
+import sqlite3
+print("yes" if hasattr(sqlite3.Connection, "enable_load_extension") else "no")
+PY
+)
   if [[ "${REQUIRE_PYTHON_TESTS:-0}" == "1" ]]; then
-    echo "Python uses unsupported SQLite $python_sqlite_version; Python tests are required" >&2
+    echo "Python tests require SQLite 3.44+ with extension loading; found SQLite $python_sqlite_version, extension loading: $python_extension_loading" >&2
     exit 1
   fi
-  echo "Skipping Python-bound tests: Python uses unsupported SQLite $python_sqlite_version"
+  echo "Skipping Python-bound tests: SQLite $python_sqlite_version, extension loading: $python_extension_loading"
 fi
 
 if "$sqlite_bin" :memory: \

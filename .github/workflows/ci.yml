@@ -125,6 +125,7 @@ jobs:
           persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: runner.os != 'macOS' && matrix.target != 'linux-aarch64'
         with:
           python-version: "3.13"
 
@@ -152,9 +153,11 @@ jobs:
             -ldl -lpthread -o sqlite3-ci
           echo "SQLITE3=$GITHUB_WORKSPACE/sqlite3-ci" >> "$GITHUB_ENV"
 
-      - name: Install SQLite (macOS)
+      - name: Install SQLite and Python (macOS)
         if: runner.os == 'macOS'
-        run: brew install sqlite
+        run: |
+          brew install sqlite python@3.13
+          echo "$(brew --prefix python@3.13)/bin" >> "$GITHUB_PATH"
 
       - name: Install SQLite (Windows)
         if: runner.os == 'Windows'
@@ -163,7 +166,7 @@ jobs:
       - name: Test extension
         shell: bash
         env:
-          REQUIRE_PYTHON_TESTS: "1"
+          REQUIRE_PYTHON_TESTS: ${{ matrix.target != 'linux-aarch64' && '1' || '0' }}
           TRANSACTION_TEST_REPETITIONS: ${{ runner.os == 'Windows' && '5' || '1' }}
         run: ./scripts/test.sh
 
@@ -172,6 +175,9 @@ jobs:
         run: cargo test --all-targets --locked
 
       - name: Compare common contracts with sqlite-vec
+        # The Ubuntu ARM runner's Python is linked to SQLite 3.37. Native ARM
+        # coverage remains mandatory in the smoke, Rust, lint, and package steps.
+        if: matrix.target != 'linux-aarch64'
         shell: bash
         env:
           RAYON_NUM_THREADS: 1
@@ -213,11 +219,11 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.x"
           cache-dependency-path: examples/clients/go/go.sum
