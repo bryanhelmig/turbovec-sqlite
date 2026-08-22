@@ -1,35 +1,76 @@
-# turbovec-sqlite
+# `turbovec-sqlite`
 
-Compressed approximate vector search for SQLite, backed by
-[TurboVec](https://github.com/RyanCodrai/turbovec).
+[![CI](https://github.com/bryanhelmig/turbovec-sqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/bryanhelmig/turbovec-sqlite/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![TurboQuant paper](https://img.shields.io/badge/paper-ICLR%202026-b31b1b.svg)](https://arxiv.org/abs/2504.19874)
 
-- Writable `turbovec0` virtual tables
-- 2-, 3-, or 4-bit inner-product search
-- Transactional persistence in ordinary SQLite shadow tables
+Compressed approximate vector search for SQLite, powered by
+[`turbovec`](https://github.com/RyanCodrai/turbovec).
 
-Larger scores are better. Start with 4-bit indexes. SQLite 3.44 or newer is
-supported.
+`turbovec-sqlite` is a loadable SQLite extension that adds writable
+`turbovec0` virtual tables. It stores 2-, 3-, or 4-bit TurboQuant codes inside
+ordinary SQLite shadow tables and searches them with TurboVec's SIMD kernels.
+There is no graph to build, no corpus-specific training step, and no sidecar
+index file.
 
-## Install
+> [!IMPORTANT]
+> `turbovec-sqlite` is experimental and pre-v1. Expect breaking changes in the
+> SQL interface and on-disk format. It is not yet published as a crate or a set
+> of release binaries.
 
-Build the native library from a source checkout:
+- Writable, transaction-aware `turbovec0` virtual tables
+- Approximate inner-product search over aggressively compressed vectors
+- Online inserts and deletes with stable SQLite `rowid` values
+- Persistence, WAL, backup, atomic commit, and recovery owned by SQLite
+- Native builds for Linux and macOS on x86-64 and ARM64, plus Windows x86-64
+
+## How it differs from an exact vector scan
+
+TurboVec is a **compressed exhaustive index**, not an HNSW or other graph-based
+ANN index. Search considers every eligible vector, but scores its compressed
+code instead of the original float32 vector. Approximation comes from
+quantization rather than candidate pruning.
+
+That tradeoff can make the index much smaller and the scan much faster, at the
+cost of imperfect recall. Start with 4-bit indexes and measure recall on your
+own embeddings before considering 3- or 2-bit codes. If exact ranking is a hard
+requirement, use an exact vector extension such as
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) instead.
+
+Scores are inner products and **larger scores are better**. For normalized
+vectors, inner-product and cosine-similarity rankings are equivalent.
+
+## Installing
+
+For now, build the extension from a source checkout. It requires Rust 1.89 or
+newer and SQLite 3.44 or newer with loadable-extension support.
 
 ```sh
+git clone https://github.com/bryanhelmig/turbovec-sqlite.git
+cd turbovec-sqlite
 cargo build --release
 ```
 
-The library is `libturbovec_sqlite.so` on Linux,
-`libturbovec_sqlite.dylib` on macOS, and `turbovec_sqlite.dll` on Windows.
-Release archives contain the same library and the client examples.
+The native library is written to:
 
-Apple's `/usr/bin/sqlite3` omits extension loading. Use Homebrew SQLite or
-load the library from your application.
+| Platform | Library |
+|---|---|
+| Linux | `target/release/libturbovec_sqlite.so` |
+| macOS | `target/release/libturbovec_sqlite.dylib` |
+| Windows | `target/release/turbovec_sqlite.dll` |
 
-## Quick start
+Apple's `/usr/bin/sqlite3` is built without extension loading. On macOS, use a
+SQLite build that enables it, such as Homebrew SQLite:
 
 ```sh
-sqlite3 demo.db
+brew install sqlite
+$(brew --prefix sqlite)/bin/sqlite3
 ```
+
+## Sample usage
+
+Load the extension and create a `turbovec0` table with a fixed dimension and
+bit width:
 
 ```sql
 -- SQLite supplies .so, .dylib, or .dll when the suffix is omitted.
@@ -52,36 +93,32 @@ order by score desc
 limit 2;
 ```
 
+```text
+rowid  score
+-----  -----------------
+1      0.999775230884552
+3      0.900349736213684
+```
+
+Run the complete example, including a join back to a content table, with:
+
+```sh
+$(brew --prefix sqlite)/bin/sqlite3 demo.db < demo.sql
+```
+
 Vectors may be JSON arrays or little-endian float32 BLOBs. `turbovec_f32()`
 converts JSON to the BLOB form. Dimensions must be a positive multiple of 8.
 
-KNN queries using `LIMIT` require `ORDER BY score DESC`. Put the KNN query in
-a CTE or subquery before joining it to a content table. See [demo.sql](demo.sql)
-for a complete example.
+KNN queries using `LIMIT` require `ORDER BY score DESC`. Put the KNN query in a
+CTE or subquery before joining it to a content table, as shown in
+[`demo.sql`](demo.sql).
 
-## Language clients
+## Writes and transactions
 
-Load the library, then use ordinary SQL. No wrapper API is required.
+Use explicit non-negative rowids. `INSERT` and `DELETE` are supported. To
+replace a vector, delete it and insert its replacement; `UPDATE` is rejected.
 
-| Language | SQLite API | Example |
-|---|---|---|
-| Python | standard `sqlite3` module | [python.py](examples/clients/python.py) |
-| JavaScript | Node 22.13+ built-in `node:sqlite` | [javascript.mjs](examples/clients/javascript.mjs) |
-| Go | `database/sql` and `mattn/go-sqlite3` | [main.go](examples/clients/go/main.go) |
-
-The examples insert the same vectors and return the same joined KNN result:
-
-```sh
-./scripts/test_clients.sh
-```
-
-The Go example requires CGO and a C compiler.
-
-## Writes
-
-Use explicit non-negative rowids. `INSERT` and `DELETE` are supported. Replace
-a vector with `DELETE` followed by `INSERT`; `UPDATE` is rejected. Batch writes
-in one transaction:
+Batch writes in one transaction:
 
 ```sql
 begin immediate;
@@ -90,32 +127,66 @@ delete from document_vectors where rowid = 2;
 commit;
 ```
 
-Batching matters because each commit serializes the in-memory index. Commit
-CPU scales with total index size, so a one-row commit can cost nearly as much
-as a larger batch. Chunking keeps WAL writes small; it does not make
-serialization incremental. [BENCHMARKS.md](BENCHMARKS.md) includes the
-repeatable write measurements.
+Batching matters because each commit serializes the in-memory index. Commit CPU
+scales with total index size, so a one-row commit can cost nearly as much as a
+larger batch. Chunking keeps WAL writes small; it does not make serialization
+incremental. [`BENCHMARKS.md`](BENCHMARKS.md) includes repeatable write
+measurements.
 
 The extension keeps a warm index per connection. SQLite shadow tables store
-metadata and 4 MiB chunks. Commits write only changed chunk spans. SQLite owns
-WAL, backup, atomic commit, and crash recovery. [DESIGN.md](DESIGN.md) explains
-the contracts and implementation.
+metadata and 4 MiB chunks. Commits write only changed chunk spans, while SQLite
+retains responsibility for WAL, backup, atomic commit, and crash recovery. See
+[`DESIGN.md`](DESIGN.md) for the virtual-table and persistence contracts.
+
+## Language clients
+
+Load the native library, then use ordinary SQL; no wrapper API is required.
+
+| Language | SQLite API | Example |
+|---|---|---|
+| Python | standard `sqlite3` module | [`python.py`](examples/clients/python.py) |
+| JavaScript | Node 22.13+ built-in `node:sqlite` | [`javascript.mjs`](examples/clients/javascript.mjs) |
+| Go | `database/sql` and `mattn/go-sqlite3` | [`main.go`](examples/clients/go/main.go) |
+
+The examples insert the same vectors and verify the same joined KNN result:
+
+```sh
+./scripts/test_clients.sh
+```
+
+The Go example requires CGO and a C compiler.
 
 ## Performance
 
-On an Apple M1, a deterministic smoke benchmark with 10,000 vectors at 1,536
-dimensions produced:
+On an Apple M1, a deterministic integration benchmark with 10,000 normalized
+vectors at 1,536 dimensions produced:
 
-| engine | database | query p50 | recall@10 |
+| Engine | Database | Query p50 | Recall@10 |
 |---|---:|---:|---:|
-| sqlite-vec exact | 60.32 MiB | 25.971 ms | 1.000 |
-| turbovec0 4-bit | 9.04 MiB | 0.509 ms | 0.791 |
-| turbovec0 2-bit | 4.83 MiB | 0.192 ms | 0.404 |
+| `sqlite-vec` 0.1.9 exact float32 | 60.32 MiB | 25.971 ms | 1.000 |
+| `turbovec0` 4-bit | 9.04 MiB | 0.509 ms | 0.791 |
+| `turbovec0` 2-bit | 4.83 MiB | 0.192 ms | 0.404 |
 
-See [BENCHMARKS.md](BENCHMARKS.md) for commands, methodology, full results,
-and limitations.
+These are deterministic synthetic vectors and integration measurements, not a
+general performance claim. The comparison pins `sqlite-vec` 0.1.9 as an exact
+float32 baseline. See [`BENCHMARKS.md`](BENCHMARKS.md) for the commands,
+methodology, full results, and limitations.
 
-## Test
+## Current limitations
+
+- Contentless virtual tables: keep documents and source vectors separately.
+- Dimensions must be a positive multiple of 8.
+- Rowids must be explicit, unique, non-negative integers.
+- Inserts and deletes are supported; updates are delete-then-insert.
+- Search is approximate and bit width is an application-level recall choice.
+- There is no SQL metadata/allowlist pushdown yet.
+- Commits still serialize the complete warmed index before comparing chunks.
+- One native library is required for each operating system and architecture.
+- The SQL interface and serialized format are not yet stable.
+
+## Development
+
+Run the core extension suite and exact-baseline comparison with:
 
 ```sh
 ./scripts/test.sh
@@ -126,44 +197,50 @@ and limitations.
 
 The suite covers the extension ABI, persistence, transactions, savepoints,
 conflict policies, WAL readers, rename, defensive mode, integrity checks,
-randomized transaction model checks, cross-language loading, and comparison
-with pinned `sqlite-vec` 0.1.9 and an exact-search oracle.
+randomized transaction models, cross-language loading, and exact-search
+oracles.
 
-CI runs the native Rust tests on the declared Rust 1.89 minimum and checks the
-current stable toolchain. The extension suite, client examples, strict Clippy,
-and release packaging run across Linux, macOS, and Windows on x86-64 and ARM64.
-Python is pinned in CI so SQLite-bound transaction tests cannot be silently
-skipped on supported runners; Ubuntu ARM is explicitly native-only because its
-Python is linked to SQLite 3.37. Dependabot and a weekly RustSec audit monitor
-locked dependencies.
+CI tests the declared Rust 1.89 minimum and current stable Rust. It builds,
+lints, tests, and packages the extension for Linux and macOS on x86-64 and
+ARM64, plus Windows x86-64, and separately verifies compatibility with SQLite
+3.44. Dependabot and a weekly RustSec audit monitor locked dependencies.
 
-## Package
+Build a release archive locally with:
 
 ```sh
 ./scripts/package.sh
 ```
 
-The archive and SHA-256 checksum land in `dist/`. CI builds Linux and macOS
-archives on x86-64 and ARM64, plus Windows x86-64. A tag named `v<VERSION>`
-publishes them as a GitHub release.
+The archive and its SHA-256 checksum are written to `dist/`. Once releases
+begin, a tag named `v<VERSION>` will publish the platform archives through the
+same tested workflow.
 
-After extraction, load `./libturbovec_sqlite` on macOS or Linux and
-`./turbovec_sqlite` on Windows. The crate pins TurboVec and the Rusqlite module
-layout so upstream changes require an explicit compatibility review.
-
-## Reference BLOB API
+## Advanced BLOB API
 
 The extension also exposes `turbovec_new`, `turbovec_build`, `turbovec_add`,
 `turbovec_remove`, index metadata functions, and `turbovec_knn`. This whole-BLOB
-path is a small correctness oracle. Each mutation rewrites the BLOB; use
-`turbovec0` for write workloads.
+path is primarily a compact reference and correctness oracle. Each mutation
+rewrites the BLOB; use `turbovec0` for normal write workloads.
 
-This crate is experimental and is not yet published.
+## References and acknowledgments
 
-## Acknowledgments
+- [*TurboQuant: Online Vector Quantization with Near-optimal Distortion
+  Rate*](https://arxiv.org/abs/2504.19874), by Amir Zandieh, Majid Daliri,
+  Majid Hadian, and Vahab Mirrokni (ICLR 2026), introduces the TurboQuant
+  algorithms this project builds on. Google Research also provides a
+  [plain-language overview](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/).
+- [`turbovec`](https://github.com/RyanCodrai/turbovec), created by Ryan Codrai,
+  is the MIT-licensed Rust implementation and SIMD vector index used directly
+  by this extension.
+- [`sqlite-vec`](https://github.com/asg017/sqlite-vec), created by Alex Garcia,
+  provides the exact float32 baseline used by this repository's comparison
+  harness.
 
-The vector index and quantization engine come from
-[TurboVec](https://github.com/RyanCodrai/turbovec), created by Ryan Codrai and
-used under the MIT License. This repository contains the SQLite extension,
-its transactional persistence layer, tests, benchmarks, client examples, and
-release packaging.
+`turbovec-sqlite` adds the SQLite virtual table, transaction-aware persistence,
+tests, benchmarks, language examples, and release packaging around the upstream
+Rust index.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE). The upstream `turbovec` dependency is also
+distributed under the MIT License.
