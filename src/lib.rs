@@ -406,7 +406,10 @@ pub unsafe extern "C" fn sqlite3_extension_init(
     error_message: *mut *mut c_char,
     api: *mut ffi::sqlite3_api_routines,
 ) -> c_int {
-    unsafe { Connection::extension_init2(db, error_message, api, extension_init) }
+    unsafe {
+        chunked::initialize_api(api);
+        Connection::extension_init2(db, error_message, api, extension_init)
+    }
 }
 
 /// Named entry point, useful for static linking and explicit loaders.
