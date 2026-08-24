@@ -154,6 +154,14 @@ larger batch. Chunking keeps WAL writes small; it does not make serialization
 incremental. [`BENCHMARKS.md`](BENCHMARKS.md) includes repeatable write
 measurements.
 
+SQLite also opens internal savepoints for statement journals, including
+subquery-sourced writes and writes through FTS5 triggers. These savepoints only
+record a change-log position; they do not serialize the index. Insert rollback
+stores rowids. The first delete or replacement in a transaction takes one lazy
+full-index checkpoint because TurboVec does not expose a compressed row for
+reinsertion. For large mixed transactions, do bulk inserts before deletes or
+replacements so the checkpoint absorbs the insert prefix.
+
 The extension keeps a warm index per connection. SQLite shadow tables store
 metadata and 4 MiB chunks. Commits write only changed chunk spans, while SQLite
 retains responsibility for WAL, backup, atomic commit, and crash recovery. See
@@ -192,6 +200,11 @@ These are deterministic synthetic vectors and integration measurements, not a
 general performance claim. The comparison pins `sqlite-vec` 0.1.9 as an exact
 float32 baseline. See [`BENCHMARKS.md`](BENCHMARKS.md) for the commands,
 methodology, full results, and limitations.
+
+The savepoint regression uses a 50,000-row, 1,536-dimensional 4-bit table and
+50 ordinary inserts with FTS5 triggers after one vector write. On the same M1,
+that statement sequence fell from 454 ms in 0.1.1 to 0.67 ms in 0.1.2. Run it
+with `python3 tests/savepoint_cost.py <extension>`.
 
 ## Current limitations
 

@@ -142,6 +142,13 @@ rows from the same statement. A future optimization needs a genuinely cheap
 in-memory snapshot or incremental TurboVec persistence; batching writes is the
 correct current advice.
 
+The 0.1.2 follow-up retained in-memory rollback but changed its shape: inserts
+record rowids, savepoints record change-log positions, and the first destructive
+change takes one lazy checkpoint. The conflict suite and a 20,000-operation
+random model passed. In the 50,000-row, 1,536-dimensional FTS5 reproducer, 50
+post-vector-write statements fell from 453.9 ms to 0.67 ms. Deletes still need
+the one lazy full-index checkpoint until TurboVec exposes compressed-row undo.
+
 ## Pooled-connection cache follow-up
 
 An immutable process-wide cache was prototyped after the allowlist work. On a

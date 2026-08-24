@@ -272,9 +272,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version=${GITHUB_REF_NAME#sqlite-v}
+          awk -v heading="## $version " '
+            index($0, heading) == 1 { found=1 }
+            found && /^## / && index($0, heading) != 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
           gh release create "$GITHUB_REF_NAME" \
             release-assets/*.tar.gz \
             release-assets/*.sha256 \
-            --notes-file CHANGELOG.md \
+            --notes-file release-notes.md \
             --verify-tag \
             --title "turbovec-sqlite $GITHUB_REF_NAME"

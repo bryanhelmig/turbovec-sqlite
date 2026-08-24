@@ -51,15 +51,19 @@ turbovec0 virtual table
     └── <name>_chunks    ordered 4 MiB serialized-index chunks
 ```
 
-At transaction start, the module snapshots the serialized index. Inserts and
-deletes mutate only the warmed copy. At `xSync`, the index is serialized once
-and compared with stored chunks. Unchanged chunks are skipped; same-size chunks
-use incremental BLOB I/O for only the differing byte range; resized and new
-chunks use ordinary SQL.
+`xBegin` starts an empty change log and `xSavepoint` records only its current
+position. Insert rollback removes appended rowids in reverse order. Before the
+first delete or replacement, the module takes one lazy serialized checkpoint;
+rollback restores it and replays only later changes. This keeps SQLite's
+statement-savepoint churn independent of index size without retaining raw
+vectors for an insert-only bulk load. Exact compressed-row undo remains an
+upstream TurboVec API opportunity.
 
-Commit discards the snapshot; rollback restores it. Savepoints retain their own
-snapshots because whole-transaction rollback alone does not make `ROLLBACK TO`
-correct.
+At `xSync`, the index is serialized once and compared with stored chunks.
+Unchanged chunks are skipped; same-size chunks use incremental BLOB I/O for
+only the differing byte range; resized and new chunks use ordinary SQL. Commit
+discards the change log and lazy checkpoint; rollback applies them to the warm
+copy while SQLite rolls back the shadow-table writes.
 
 Every committed write increments `generation`. A reader checks this cheap value
 before using its cache and reloads chunks if another connection committed a new
