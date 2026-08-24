@@ -236,7 +236,9 @@ Build a release archive locally with:
 ```
 
 The archive and its SHA-256 checksum are written to `dist/`. A tag named
-`v<VERSION>` publishes the platform archives through the same tested workflow.
+`sqlite-v<VERSION>` publishes the platform archives through the same tested
+workflow. The prefix keeps extension releases distinct from upstream TurboVec
+tags retained in the repository history.
 
 ## Advanced BLOB API
 
