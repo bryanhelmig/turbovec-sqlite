@@ -176,6 +176,11 @@ jobs:
         shell: bash
         run: cargo test --all-targets --locked
 
+      - name: Test static linking
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/test_static.sh
+
       - name: Compare common contracts with sqlite-vec
         # The Ubuntu ARM runner's Python is linked to SQLite 3.37. Native ARM
         # coverage remains mandatory in the smoke, Rust, lint, and package steps.
