@@ -10,10 +10,12 @@ case "$(uname -s)" in
     archive="$static_target_root/release/libturbovec_sqlite.a"
     sqlite_prefix=${SQLITE_PREFIX:-"$(brew --prefix sqlite)"}
     sqlite_flags=(-I"$sqlite_prefix/include" -L"$sqlite_prefix/lib" -lsqlite3 -liconv)
+    check_archive_symbols=0
     ;;
   Linux)
     archive="$static_target_root/release/libturbovec_sqlite.a"
     sqlite_flags=(-lsqlite3 -ldl -lpthread -lm)
+    check_archive_symbols=1
     ;;
   MINGW*|MSYS*|CYGWIN*)
     echo "Static-link smoke test is not configured for Windows; archive export is checked by packaging."
@@ -26,12 +28,14 @@ cd "$repo_root"
 cargo build --release --locked --no-default-features --target-dir "$static_target_root"
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/turbovec-static-test.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT
-nm -g "$archive" > "$test_dir/archive-symbols.txt" 2>/dev/null
-if grep -q 'sqlite3_extension_init' "$test_dir/archive-symbols.txt"; then
-  echo "Static archive must not export the generic sqlite3_extension_init symbol" >&2
-  exit 1
+if [[ "$check_archive_symbols" == 1 ]]; then
+  nm -g "$archive" > "$test_dir/archive-symbols.txt"
+  if grep -q 'sqlite3_extension_init' "$test_dir/archive-symbols.txt"; then
+    echo "Static archive must not export the generic sqlite3_extension_init symbol" >&2
+    exit 1
+  fi
+  grep -q 'sqlite3_turbovec_init' "$test_dir/archive-symbols.txt"
 fi
-grep -q 'sqlite3_turbovec_init' "$test_dir/archive-symbols.txt"
 
 cc -std=c11 -Wall -Wextra -Werror \
   -DTURBOVEC_SQLITE_VERSION="\"$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)\"" \

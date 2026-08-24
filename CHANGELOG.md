@@ -4,6 +4,7 @@
 
 - Prepared the repository and install path for public use.
 - Added a private security-reporting policy and third-party license notices.
+- Made the static-link smoke portable across Apple and GNU archive tools.
 - Reduced routine pull-request CI to Linux quality and SQLite compatibility
   gates; tags and manual runs retain the complete five-platform release matrix.
 - Normalized contributor identity display through `.mailmap`.
