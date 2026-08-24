@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.3 — 2026-08-24
+
+- Added `turbovec_info(table)` diagnostics and explicit format v7 revision 2
+  checks alongside `turbovec_version()`.
+- Added static libraries, a C header, and a static-registration smoke test.
+- Added a fixed real-embedding recall gate using a public-domain GloVe fixture.
+- Updated the Go client to load every pooled connection with `ConnectHook` and
+  demonstrate filtered KNN.
+- Reworked the README around install, core SQL, operating costs, drift recovery,
+  compatibility, and release consumption.
+- Moved architecture and benchmark notes under `docs/` and the CLI demo under
+  `examples/`.
+
 ## 0.1.2 — 2026-08-24
 
 - Made `xBegin` and `xSavepoint` metadata-only for insert transactions.

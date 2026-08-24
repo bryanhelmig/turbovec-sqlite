@@ -14,6 +14,7 @@ import (
 type document struct {
 	id     int
 	body   string
+	path   string
 	vector []float32
 }
 
@@ -29,7 +30,11 @@ func main() {
 	}
 
 	sql.Register("sqlite3_turbovec", &sqlite3.SQLiteDriver{
-		Extensions: []string{extension},
+		// database/sql may open more than one connection. ConnectHook loads the
+		// extension into every connection rather than only the first one.
+		ConnectHook: func(connection *sqlite3.SQLiteConn) error {
+			return connection.LoadExtension(extension, "sqlite3_turbovec_init")
+		},
 	})
 	db, err := sql.Open("sqlite3_turbovec", ":memory:")
 	if err != nil {
@@ -39,7 +44,11 @@ func main() {
 	db.SetMaxOpenConns(1)
 
 	_, err = db.Exec(`
-		create table documents(id integer primary key, body text not null);
+		create table documents(
+			id integer primary key,
+			body text not null,
+			path text not null
+		);
 		create virtual table document_vectors using turbovec0(
 			dimensions=8,
 			bit_width=4
@@ -50,9 +59,9 @@ func main() {
 	}
 
 	documents := []document{
-		{1, "east", []float32{1, 0, 0, 0, 0, 0, 0, 0}},
-		{2, "north", []float32{0, 1, 0, 0, 0, 0, 0, 0}},
-		{3, "near east", []float32{0.9, 0.1, 0, 0, 0, 0, 0, 0}},
+		{1, "east", "guides/east.yaml", []float32{1, 0, 0, 0, 0, 0, 0, 0}},
+		{2, "north", "notes/north.txt", []float32{0, 1, 0, 0, 0, 0, 0, 0}},
+		{3, "near east", "guides/near-east.yaml", []float32{0.9, 0.1, 0, 0, 0, 0, 0, 0}},
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -64,7 +73,10 @@ func main() {
 			log.Fatal(err)
 		}
 		if _, err := tx.Exec(
-			"insert into documents(id, body) values (?, ?)", item.id, item.body,
+			"insert into documents(id, body, path) values (?, ?, ?)",
+			item.id,
+			item.body,
+			item.path,
 		); err != nil {
 			log.Fatal(err)
 		}
@@ -88,6 +100,9 @@ func main() {
 			select rowid, score
 			from document_vectors
 			where embedding match ?
+			  and rowid in (
+				select id from documents where path glob ?
+			  )
 			order by score desc
 			limit ?
 		)
@@ -95,7 +110,7 @@ func main() {
 		from matches
 		join documents as d on d.id = matches.rowid
 		order by matches.score desc
-	`, string(query), 2)
+	`, string(query), "*.yaml", 2)
 	if err != nil {
 		log.Fatal(err)
 	}

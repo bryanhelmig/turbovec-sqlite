@@ -95,10 +95,15 @@ by bit width.
   result conversions are checked before reaching the core.
 - Rust panics are caught at C callback boundaries; unwinding may not cross the
   SQLite ABI.
-- Both conventional `sqlite3_extension_init` and named
-  `sqlite3_turbovec_init` entry points are exported.
-- The build produces one native dynamic library per OS/architecture. SQLite's
-  stable extension ABI avoids linking the extension to one SQLite release.
+- Loadable builds export conventional `sqlite3_extension_init` and named
+  `sqlite3_turbovec_init` entry points. Static release archives export only the
+  named entry point, avoiding collisions with other statically linked
+  extensions.
+- The build produces native dynamic and static libraries per OS/architecture.
+  SQLite's stable extension ABI avoids tying the loadable library to one SQLite
+  release.
+- The extension pins TurboVec disk format v7 revision 2 independently of the
+  crate version. Load rejects another magic or revision before deserialization.
 
 Rusqlite 0.40 does not expose savepoint, shadow-name, or integrity module
 callbacks through its builder. This crate pins 0.40.2 and locally fills those
