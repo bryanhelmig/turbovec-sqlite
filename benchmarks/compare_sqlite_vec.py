@@ -339,7 +339,7 @@ def main() -> None:
         "machine": platform.machine(),
         "rayon_num_threads": os.environ.get("RAYON_NUM_THREADS", "default"),
         "sqlite_vec_version": "0.1.9",
-        "turbovec_sqlite_version": "0.1.0",
+        "turbovec_sqlite_version": "0.1.1",
         "metric": {
             "name": "quality-adjusted queries per second",
             "engine": args.score_engine,

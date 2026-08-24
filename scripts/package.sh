@@ -30,7 +30,7 @@ trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$repo_root/dist" "$stage/$package"
 cp "$target_root/release/$library" "$stage/$package/"
-cp "$crate_root/README.md" "$crate_root/DESIGN.md" \
+cp "$crate_root/README.md" "$crate_root/CHANGELOG.md" "$crate_root/DESIGN.md" \
   "$crate_root/BENCHMARKS.md" "$crate_root/PERFORMANCE_EXPERIMENTS.md" \
   "$crate_root/demo.sql" \
   "$repo_root/LICENSE" "$stage/$package/"
@@ -50,6 +50,7 @@ tar -tzf "$archive" > "$stage/archive-contents.txt"
 for required in \
   "$library" \
   README.md \
+  CHANGELOG.md \
   DESIGN.md \
   BENCHMARKS.md \
   PERFORMANCE_EXPERIMENTS.md \
