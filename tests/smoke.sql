@@ -2,7 +2,7 @@
 
 create table assertions(ok integer not null check(ok));
 
-insert into assertions values (turbovec_version() = '0.1.3');
+insert into assertions values (turbovec_version() = '0.1.4');
 insert into assertions values (length(turbovec_f32('[1, 2, 3]')) = 12);
 
 create table documents(

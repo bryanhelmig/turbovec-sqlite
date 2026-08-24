@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 — 2026-08-24
+
+- Prepared the repository and install path for public use.
+- Added a private security-reporting policy and third-party license notices.
+- Reduced routine pull-request CI to Linux quality and SQLite compatibility
+  gates; tags and manual runs retain the complete five-platform release matrix.
+- Normalized contributor identity display through `.mailmap`.
+
 ## 0.1.3 — 2026-08-24
 
 - Added `turbovec_info(table)` diagnostics and explicit format v7 revision 2

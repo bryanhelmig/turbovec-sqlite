@@ -32,7 +32,12 @@ trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$repo_root/dist" "$stage/$package"
 cp "$target_root/release/$library" "$static_target_root/release/$static_library" "$stage/$package/"
-cp "$crate_root/README.md" "$crate_root/CHANGELOG.md" "$repo_root/LICENSE" "$stage/$package/"
+cp "$crate_root/README.md" \
+  "$crate_root/CHANGELOG.md" \
+  "$crate_root/SECURITY.md" \
+  "$crate_root/THIRD_PARTY_LICENSES.html" \
+  "$repo_root/LICENSE" \
+  "$stage/$package/"
 mkdir -p "$stage/$package/docs" "$stage/$package/examples" "$stage/$package/include"
 cp "$crate_root/docs/"*.md "$stage/$package/docs/"
 cp "$crate_root/examples/demo.sql" "$stage/$package/examples/"
@@ -61,6 +66,8 @@ for required in \
   "$static_library" \
   README.md \
   CHANGELOG.md \
+  SECURITY.md \
+  THIRD_PARTY_LICENSES.html \
   LICENSE \
   docs/DESIGN.md \
   docs/BENCHMARKS.md \

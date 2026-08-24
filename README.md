@@ -16,16 +16,14 @@ backup, atomic commit, and recovery.
 ## Install
 
 Release archives contain the loadable library, static library, C header,
-examples, and SHA-256 checksum. For this private repository, download one with
-an authenticated GitHub CLI:
+examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.1.3
+version=0.1.4
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
-gh release download sqlite-v$version \
-  --repo bryanhelmig/turbovec-sqlite \
-  --pattern "$asset" \
-  --pattern "$asset.sha256"
+base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
+curl -fLO "$base/$asset"
+curl -fLO "$base/$asset.sha256"
 shasum -a 256 -c "$asset.sha256"
 tar -xzf "$asset"
 ```
@@ -37,14 +35,14 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.1.3-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.1.4-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
 Build from source with Rust 1.89 or newer:
 
 ```sh
-git clone git@github.com:bryanhelmig/turbovec-sqlite.git
+git clone https://github.com/bryanhelmig/turbovec-sqlite.git
 cd turbovec-sqlite
 cargo build --release --locked
 ```
@@ -109,7 +107,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.1.3
+-- 0.1.4
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
@@ -261,7 +259,7 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and disk format are separate. Version 0.1.3 writes TurboVec
+The crate version and disk format are separate. Version 0.1.4 writes TurboVec
 format v7, revision 2. During 0.x, a release may intentionally break disk
 compatibility and will say so in the changelog. The extension checks the header
 before deserialization and refuses another format or revision with a specific
@@ -276,6 +274,12 @@ error. Keep a recoverable copy of source embeddings.
 ./scripts/compare_sqlite_vec.sh
 ./scripts/write_score.sh
 ./scripts/package.sh
+```
+
+When dependencies change, regenerate the bundled notices with:
+
+```sh
+cargo about generate about.hbs -o THIRD_PARTY_LICENSES.html
 ```
 
 Correctness gates cover transactions, nested swap-and-pop rollback, FTS5
@@ -295,4 +299,5 @@ uses Ryan Codrai's MIT-licensed
 [`turbovec`](https://github.com/RyanCodrai/turbovec) crate and compares against
 Alex Garcia's [`sqlite-vec`](https://github.com/asg017/sqlite-vec).
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE), [third-party licenses](THIRD_PARTY_LICENSES.html),
+and the [security policy](SECURITY.md).
