@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 — Unreleased
+## 0.1.1 — 2026-08-24
 
 - Added writable `turbovec0` virtual tables backed by SQLite shadow tables.
 - Added transaction, WAL, savepoint, integrity, rename, and reopen coverage.
