@@ -228,6 +228,7 @@ CI tests the declared Rust 1.89 minimum and current stable Rust. It builds,
 lints, tests, and packages the extension for Linux and macOS on x86-64 and
 ARM64, plus Windows x86-64, and separately verifies compatibility with SQLite
 3.44. Dependabot and a weekly RustSec audit monitor locked dependencies.
+See [`CHANGELOG.md`](CHANGELOG.md) for release notes.
 
 Build a release archive locally with:
 
