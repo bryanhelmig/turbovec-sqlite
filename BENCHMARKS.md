@@ -30,6 +30,29 @@ index. Its one score is committed mutations per second. Mutation time, commit
 time, single-vector commit time, rollback time, reopen time, WAL bytes,
 database size, and correctness remain visible guardrails.
 
+For filtered search:
+
+```sh
+./scripts/allowlist_bench.sh \
+  --rows 10000 --dimensions 1536 --queries 100
+```
+
+This includes the cost of selecting IDs from an indexed SQLite table. It also
+checks each selective top-k against a filtered full compressed ranking.
+
+On the Apple M1 used below, that shape produced:
+
+| eligible rows | query p50 | query p95 | vs full |
+|---|---:|---:|---:|
+| all rows | 0.520 ms | 0.644 ms | 1.00x |
+| clustered 10% | 0.213 ms | 0.246 ms | 2.44x |
+| scattered 10% | 0.648 ms | 0.774 ms | 0.80x |
+| clustered 1% | 0.084 ms | 0.091 ms | 6.17x |
+
+The block mask rewards locality: clustered IDs skip compressed 32-row blocks;
+scattered IDs can touch nearly all of them. The pushdown is still the correct
+way to ask for a filtered top-k even when selection overhead makes it slower.
+
 For a custom comparison shape:
 
 ```sh

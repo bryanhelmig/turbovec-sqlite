@@ -12,8 +12,8 @@ table is uncalibrated; adding calibration requires an explicit lifecycle for
 sampling, freezing, persistence, and later inserts.
 
 `IdMapIndex` adds stable `u64` IDs, online inserts, swap-and-pop removal, and an
-ID allowlist. The allowlist can skip empty 32-row blocks, which is a useful
-future hook for SQL metadata, tenant, ACL, or FTS filtering.
+ID allowlist. `turbovec0` uses it for SQL metadata, tenant, ACL, or FTS
+filtering. The mask can skip 32-row blocks with no eligible IDs.
 
 ## Why a virtual table
 
@@ -26,10 +26,21 @@ A SQLite virtual table is both a planner protocol and a transaction participant:
 - savepoint callbacks keep nested rollback consistent with in-memory state.
 - `xShadowName` identifies extension-owned implementation tables.
 
-`turbovec0` consumes `embedding MATCH ?`, ordinary `LIMIT`, and descending
-score order. A hidden `k` constraint remains as compatibility syntax. It
-supports point rowid lookup and full rowid scans for ordinary SQLite operations
-such as `DELETE` and `count(*)`.
+`turbovec0` consumes `embedding MATCH ?`, integer `rowid IN (...)`, ordinary
+`LIMIT`, and descending score order. A hidden `k` constraint remains as
+compatibility syntax. It supports point rowid lookup and full rowid scans for
+ordinary SQLite operations such as `DELETE` and `count(*)`.
+
+SQLite presents `IN` to `xBestIndex` as an equality constraint. The module uses
+SQLite's all-at-once IN API to receive the complete rowid set in one cursor
+call, drops IDs without vectors, and hands the remaining IDs to `IdMapIndex`.
+This computes the exact top-k within the allowed set under TurboVec's compressed
+score. A post-filtered fixed overfetch cannot make that guarantee.
+
+Allowlist speed depends on physical locality. Clustered IDs leave whole
+32-vector blocks empty and can avoid most scoring. Widely scattered IDs may
+touch nearly every block, so the exact filtered query can cost as much as a
+full compressed scan plus selection. Correctness does not depend on locality.
 
 ## Persistence
 
@@ -85,17 +96,34 @@ by bit width.
 - The build produces one native dynamic library per OS/architecture. SQLite's
   stable extension ABI avoids linking the extension to one SQLite release.
 
-Rusqlite 0.40 does not expose savepoint or shadow-name module callbacks. This
-crate pins 0.40.2 and locally fills those callbacks in its `sqlite3_module`.
-That small compatibility seam should be removed when Rusqlite exposes them.
+Rusqlite 0.40 does not expose savepoint, shadow-name, or integrity module
+callbacks through its builder. This crate pins 0.40.2 and locally fills those
+callbacks in its `sqlite3_module`. That small compatibility seam should be
+removed when Rusqlite exposes them.
 
 ## Current limits
 
 - Contentless table only: callers keep documents and raw vectors separately.
-- Explicit rowids; insert and delete only. Replacement is delete plus insert.
+- Explicit rowids. Insert, delete, and `INSERT OR REPLACE` are supported;
+  ordinary `UPDATE` is not.
 - Serialization still builds one complete in-memory byte buffer before chunk
   comparison; storage writes are chunk-local, peak serialization memory is not.
-- No `rowid IN (...)` allowlist pushdown yet.
+- Allowlist pushdown accepts SQLite INTEGER rowids, not arbitrary virtual-table
+  column predicates. Express metadata filters as a rowid subquery.
 - No automatic content triggers or WASM build.
-- Cross-platform release automation is ready, but no binaries are published
-  yet. A long-running crash/fuzz campaign also remains release work.
+- A long-running crash/fuzz campaign remains release work.
+
+## Next performance work
+
+1. Share immutable committed indexes across pooled connections. A prototype
+   made later 20,000-row, 1,536-dimensional loads about 20x faster, but changes
+   to shared-state layout destabilized the `INSERT OR FAIL` savepoint contract.
+   Require a minimal ABI reproducer before retrying it.
+2. Add incremental serialization and chunk-granular reload in TurboVec's core
+   format. SQLite already writes changed byte spans, but the extension still
+   constructs the whole serialized index before comparing chunks.
+3. Make the serialized form directly or lazily searchable so a one-shot CLI
+   does not pay a full transform before its first query.
+
+Opt-in trigger use is a separate security/API decision. `DIRECTONLY` remains
+the safe default.

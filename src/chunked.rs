@@ -1,6 +1,7 @@
 //! Writable `turbovec0` virtual table with chunked SQLite-owned persistence.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_int};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -33,6 +34,79 @@ const PLAN_KIND_MASK: c_int = 0x0f;
 const PLAN_HAS_K: c_int = 0x10;
 const PLAN_HAS_LIMIT: c_int = 0x20;
 const PLAN_HAS_OFFSET: c_int = 0x40;
+const PLAN_HAS_ROWID_FILTER: c_int = 0x80;
+const PLAN_ROWID_FILTER_IN: c_int = 0x100;
+
+// sqlite3_api_routines pointer slots from SQLite's stable sqlite3ext.h ABI.
+// The IN callbacks were appended in SQLite 3.38; this project supports 3.44+.
+const API_LIBVERSION_NUMBER: usize = 67;
+const API_VTAB_IN: usize = 259;
+const API_VTAB_IN_FIRST: usize = 260;
+const API_VTAB_IN_NEXT: usize = 261;
+
+type BestIndexCallback =
+    unsafe extern "C" fn(*mut ffi::sqlite3_vtab, *mut ffi::sqlite3_index_info) -> c_int;
+type FilterCallback = unsafe extern "C" fn(
+    *mut ffi::sqlite3_vtab_cursor,
+    c_int,
+    *const c_char,
+    c_int,
+    *mut *mut ffi::sqlite3_value,
+) -> c_int;
+type IntegrityCallback = unsafe extern "C" fn(
+    *mut ffi::sqlite3_vtab,
+    *const c_char,
+    *const c_char,
+    c_int,
+    *mut *mut c_char,
+) -> c_int;
+type VtabInCallback = unsafe extern "C" fn(*mut ffi::sqlite3_index_info, c_int, c_int) -> c_int;
+type VtabInIterCallback =
+    unsafe extern "C" fn(*mut ffi::sqlite3_value, *mut *mut ffi::sqlite3_value) -> c_int;
+
+#[repr(C)]
+struct ModuleV4 {
+    module: ffi::sqlite3_module,
+    x_integrity: Option<IntegrityCallback>,
+}
+
+static ORIGINAL_BEST_INDEX: OnceLock<usize> = OnceLock::new();
+static ORIGINAL_FILTER: OnceLock<usize> = OnceLock::new();
+static VTAB_IN: OnceLock<usize> = OnceLock::new();
+static VTAB_IN_FIRST: OnceLock<usize> = OnceLock::new();
+static VTAB_IN_NEXT: OnceLock<usize> = OnceLock::new();
+
+thread_local! {
+    static CURRENT_INDEX_INFO: Cell<*mut ffi::sqlite3_index_info> = const { Cell::new(ptr::null_mut()) };
+    static CURRENT_FILTER_ARGS: Cell<(*mut *mut ffi::sqlite3_value, c_int)> = const { Cell::new((ptr::null_mut(), 0)) };
+}
+
+/// Capture the post-3.38 virtual-table callbacks without compiling every
+/// SQLite call against the build machine's newest API table.
+pub(crate) unsafe fn initialize_api(api: *mut ffi::sqlite3_api_routines) {
+    if api.is_null() {
+        return;
+    }
+    let slots = api.cast::<usize>();
+    let version_pointer = unsafe { *slots.add(API_LIBVERSION_NUMBER) };
+    if version_pointer == 0 {
+        return;
+    }
+    let version: unsafe extern "C" fn() -> c_int = unsafe { std::mem::transmute(version_pointer) };
+    if unsafe { version() } < 3_038_000 {
+        return;
+    }
+    for (slot, destination) in [
+        (API_VTAB_IN, &VTAB_IN),
+        (API_VTAB_IN_FIRST, &VTAB_IN_FIRST),
+        (API_VTAB_IN_NEXT, &VTAB_IN_NEXT),
+    ] {
+        let pointer = unsafe { *slots.add(slot) };
+        if pointer != 0 {
+            let _ = destination.set(pointer);
+        }
+    }
+}
 
 pub(crate) fn register(connection: &Connection) -> Result<()> {
     let result = unsafe {
@@ -52,22 +126,6 @@ pub(crate) fn register(connection: &Connection) -> Result<()> {
 }
 
 fn raw_module() -> *const ffi::sqlite3_module {
-    type IntegrityCallback = unsafe extern "C" fn(
-        *mut ffi::sqlite3_vtab,
-        *const c_char,
-        *const c_char,
-        c_int,
-        *mut *mut c_char,
-    ) -> c_int;
-
-    #[repr(C)]
-    struct ModuleV4 {
-        module: ffi::sqlite3_module,
-        // The loadable-extension bindings expose the v3 prefix. SQLite 3.44
-        // appended xIntegrity for v4, so keep that ABI field explicitly.
-        x_integrity: Option<IntegrityCallback>,
-    }
-
     static MODULE_POINTER: OnceLock<usize> = OnceLock::new();
     let pointer = *MODULE_POINTER.get_or_init(|| {
         const RUSQLITE_MODULE: Module<TurboVecTable> = Module::update_module_with_tx();
@@ -82,6 +140,12 @@ fn raw_module() -> *const ffi::sqlite3_module {
         module.xRelease = Some(release);
         module.xRollbackTo = Some(rollback_to);
         module.xShadowName = Some(shadow_name);
+        let original_best_index = module.xBestIndex.expect("Rusqlite xBestIndex callback");
+        let original_filter = module.xFilter.expect("Rusqlite xFilter callback");
+        let _ = ORIGINAL_BEST_INDEX.set(original_best_index as usize);
+        let _ = ORIGINAL_FILTER.set(original_filter as usize);
+        module.xBestIndex = Some(best_index_with_raw_info);
+        module.xFilter = Some(filter_with_raw_args);
         let module = ModuleV4 {
             module,
             x_integrity: Some(integrity),
@@ -89,6 +153,101 @@ fn raw_module() -> *const ffi::sqlite3_module {
         Box::into_raw(Box::new(module)) as usize
     });
     pointer as *const ffi::sqlite3_module
+}
+
+unsafe extern "C" fn best_index_with_raw_info(
+    table: *mut ffi::sqlite3_vtab,
+    info: *mut ffi::sqlite3_index_info,
+) -> c_int {
+    let previous = CURRENT_INDEX_INFO.with(|current| current.replace(info));
+    let callback: BestIndexCallback = unsafe {
+        std::mem::transmute(
+            *ORIGINAL_BEST_INDEX
+                .get()
+                .expect("original xBestIndex callback"),
+        )
+    };
+    let result = unsafe { callback(table, info) };
+    CURRENT_INDEX_INFO.with(|current| current.set(previous));
+    result
+}
+
+unsafe extern "C" fn filter_with_raw_args(
+    cursor: *mut ffi::sqlite3_vtab_cursor,
+    plan: c_int,
+    index_string: *const c_char,
+    argument_count: c_int,
+    arguments: *mut *mut ffi::sqlite3_value,
+) -> c_int {
+    let previous = CURRENT_FILTER_ARGS.with(|current| current.replace((arguments, argument_count)));
+    let callback: FilterCallback =
+        unsafe { std::mem::transmute(*ORIGINAL_FILTER.get().expect("original xFilter callback")) };
+    let result = unsafe { callback(cursor, plan, index_string, argument_count, arguments) };
+    CURRENT_FILTER_ARGS.with(|current| current.set(previous));
+    result
+}
+
+fn current_index_info() -> Result<*mut ffi::sqlite3_index_info> {
+    CURRENT_INDEX_INFO.with(|current| {
+        let info = current.get();
+        (!info.is_null())
+            .then_some(info)
+            .ok_or_else(|| error("turbovec0 planner callback is unavailable"))
+    })
+}
+
+fn current_filter_argument(index: usize) -> Result<*mut ffi::sqlite3_value> {
+    CURRENT_FILTER_ARGS.with(|current| {
+        let (arguments, count) = current.get();
+        if arguments.is_null() || index >= usize::try_from(count).unwrap_or(0) {
+            return Err(error(format!(
+                "turbovec0 filter argument {index} is unavailable"
+            )));
+        }
+        Ok(unsafe { *arguments.add(index) })
+    })
+}
+
+fn vtab_in(info: *mut ffi::sqlite3_index_info, index: usize, mode: c_int) -> Result<bool> {
+    let pointer = *VTAB_IN
+        .get()
+        .ok_or_else(|| error("turbovec0 rowid IN pushdown requires SQLite 3.38 or newer"))?;
+    let callback: VtabInCallback = unsafe { std::mem::transmute(pointer) };
+    Ok(unsafe { callback(info, index as c_int, mode) } != 0)
+}
+
+fn append_in_values(list: *mut ffi::sqlite3_value, ids: &mut Vec<u64>) -> Result<()> {
+    let first_pointer = *VTAB_IN_FIRST
+        .get()
+        .ok_or_else(|| error("turbovec0 rowid IN pushdown requires SQLite 3.38 or newer"))?;
+    let next_pointer = *VTAB_IN_NEXT
+        .get()
+        .ok_or_else(|| error("turbovec0 rowid IN pushdown requires SQLite 3.38 or newer"))?;
+    let first: VtabInIterCallback = unsafe { std::mem::transmute(first_pointer) };
+    let next: VtabInIterCallback = unsafe { std::mem::transmute(next_pointer) };
+    let mut value = ptr::null_mut();
+    let mut result = unsafe { first(list, &mut value) };
+    while result == ffi::SQLITE_OK {
+        match unsafe { ffi::sqlite3_value_type(value) } {
+            ffi::SQLITE_INTEGER => {
+                let rowid = unsafe { ffi::sqlite3_value_int64(value) };
+                if let Ok(id) = u64::try_from(rowid) {
+                    ids.push(id);
+                }
+            }
+            ffi::SQLITE_NULL => {}
+            _ => return Err(error("rowid allowlist values must be SQLite INTEGERs")),
+        }
+        result = unsafe { next(list, &mut value) };
+    }
+    if result == ffi::SQLITE_DONE {
+        Ok(())
+    } else {
+        Err(sqlite_error(
+            result,
+            "cannot read turbovec0 rowid IN values",
+        ))
+    }
 }
 
 unsafe extern "C" fn shadow_name(name: *const c_char) -> c_int {
@@ -572,16 +731,26 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
 
     fn best_index(&self, info: &mut IndexInfo) -> Result<bool> {
         let mut rowid = None;
+        let mut rowid_is_in = false;
         let mut query = None;
+        let mut unusable_query = false;
         let mut k = None;
         let mut limit = None;
         let mut offset = None;
         for (index, constraint) in info.constraints().enumerate() {
             if !constraint.is_usable() {
+                if constraint.column() == COL_EMBEDDING
+                    && constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_MATCH
+                {
+                    unusable_query = true;
+                }
                 continue;
             }
             match (constraint.column(), constraint.operator()) {
-                (-1, IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ) => rowid = Some(index),
+                (-1, IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ) => {
+                    rowid = Some(index);
+                    rowid_is_in = vtab_in(current_index_info()?, index, -1)?;
+                }
                 (COL_EMBEDDING, IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_MATCH) => {
                     query = Some(index)
                 }
@@ -600,14 +769,19 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
 
         if let Some(query) = query {
             if k.is_none() && limit.is_none() {
-                return Ok(false);
+                return Err(error(
+                    "turbovec0 MATCH requires a single-table scan with ORDER BY score DESC LIMIT n \
+                     (or hidden k=n); bind the query or use a scalar subquery before joining",
+                ));
             }
             // LIMIT defines the TurboVec candidate count only for nearest-first
             // ordering. Otherwise fetching LIMIT winners and letting SQLite
             // reorder that subset would produce a plausible but incorrect
             // global result.
             if limit.is_some() && !ordered_by_score_desc {
-                return Ok(false);
+                return Err(error(
+                    "turbovec0 LIMIT requires ORDER BY the unmodified score column DESC",
+                ));
             }
             let mut query_usage = info.constraint_usage(query);
             query_usage.set_argv_index(1);
@@ -636,16 +810,38 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
                 // SQLite still applies OFFSET after the module produces
                 // LIMIT+OFFSET candidates.
                 usage.set_omit(false);
+                argument += 1;
                 plan |= PLAN_HAS_OFFSET;
+            }
+            if let Some(rowid) = rowid {
+                if rowid_is_in && !vtab_in(current_index_info()?, rowid, 1)? {
+                    return Ok(false);
+                }
+                let mut usage = info.constraint_usage(rowid);
+                usage.set_argv_index(argument);
+                usage.set_omit(true);
+                plan |= PLAN_HAS_ROWID_FILTER;
+                if rowid_is_in {
+                    plan |= PLAN_ROWID_FILTER_IN;
+                }
             }
             info.set_order_by_consumed(ordered_by_score_desc);
             info.set_idx_num(plan);
+            info.set_idx_str(if rowid.is_some() {
+                "knn+rowid-allowlist"
+            } else {
+                "knn"
+            });
             info.set_estimated_cost(
                 self.state
                     .lock()
                     .map_or(1_000_000.0, |s| s.index.len() as f64),
             );
             info.set_estimated_rows(10);
+        } else if unusable_query {
+            return Err(error(
+                "turbovec0 MATCH query is not constant for this scan; use a bound value or scalar subquery",
+            ));
         } else if let Some(rowid) = rowid {
             let mut usage = info.constraint_usage(rowid);
             usage.set_argv_index(1);
@@ -938,9 +1134,27 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
                 };
                 let offset = if plan & PLAN_HAS_OFFSET != 0 {
                     let value: i64 = args.get(argument)?;
+                    argument += 1;
                     usize::try_from(value).unwrap_or(0)
                 } else {
                     0
+                };
+                let allowlist = if plan & PLAN_HAS_ROWID_FILTER != 0 {
+                    let mut ids = Vec::new();
+                    if plan & PLAN_ROWID_FILTER_IN != 0 {
+                        append_in_values(current_filter_argument(argument)?, &mut ids)?;
+                        ids.retain(|id| state.index.contains(*id));
+                    } else {
+                        let value: i64 = args.get(argument)?;
+                        if let Ok(id) = u64::try_from(value)
+                            && state.index.contains(id)
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    Some(ids)
+                } else {
+                    None
                 };
                 let limit_with_offset = limit
                     .map(|limit| limit.saturating_add(offset))
@@ -949,9 +1163,12 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
                     .map(|k| k.min(limit_with_offset))
                     .unwrap_or(limit_with_offset)
                     .min(state.index.len());
+                if allowlist.as_ref().is_some_and(Vec::is_empty) {
+                    return Ok(());
+                }
                 let results = state
                     .index
-                    .try_search(&query, k)
+                    .try_search_with_allowlist(&query, k, allowlist.as_deref())
                     .map_err(|cause| error(format!("TurboVec search failed: {cause}")))?;
                 results
                     .ids
