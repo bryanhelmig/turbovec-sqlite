@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 — 2026-08-24
+
+- Made `xBegin` and `xSavepoint` metadata-only for insert transactions.
+- Added change-log rollback for inserts and lazy checkpoints for deletes and
+  replacements.
+- Added nested swap-and-pop rollback coverage and an FTS5 savepoint-cost gate.
+- Fixed `OR FAIL` and other conflict policies by passing SQLite's required
+  `SQLITE_VTAB_CONSTRAINT_SUPPORT` argument explicitly.
+
 ## 0.1.1 — 2026-08-24
 
 - Added writable `turbovec0` virtual tables backed by SQLite shadow tables.

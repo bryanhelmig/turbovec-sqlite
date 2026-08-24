@@ -30,6 +30,17 @@ index. Its one score is committed mutations per second. Mutation time, commit
 time, single-vector commit time, rollback time, reopen time, WAL bytes,
 database size, and correctness remain visible guardrails.
 
+For SQLite statement-savepoint churn after a vector write:
+
+```sh
+python3 tests/savepoint_cost.py target/release/libturbovec_sqlite.dylib
+```
+
+The default builds 50,000 1,536-dimensional vectors, then compares 50 ordinary
+inserts with FTS5 triggers before and after a `turbovec0` write. On the Apple M1
+used here, the post-write sequence fell from 453.9 ms in 0.1.1 to 0.67 ms in
+0.1.2. The check permits timing noise but rejects index-sized savepoint work.
+
 For filtered search:
 
 ```sh
