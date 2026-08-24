@@ -506,9 +506,36 @@ fn validate_geometry(index: &IdMapIndex, dimensions: usize, bit_width: usize) ->
 struct State {
     generation: i64,
     index: IdMapIndex,
-    transaction_snapshot: Option<(i64, Vec<u8>)>,
-    savepoints: Vec<(c_int, Vec<u8>, bool)>,
+    transaction: Option<TransactionState>,
     dirty: bool,
+}
+
+enum Change {
+    Insert { id: u64, vector: Option<Vec<f32>> },
+    Delete { id: u64 },
+}
+
+struct DestructiveCheckpoint {
+    change_index: usize,
+    payload: Vec<u8>,
+}
+
+struct TransactionState {
+    start_generation: i64,
+    changes: Vec<Change>,
+    destructive_checkpoint: Option<DestructiveCheckpoint>,
+    savepoints: Vec<(c_int, usize)>,
+}
+
+impl TransactionState {
+    fn new(start_generation: i64) -> Self {
+        Self {
+            start_generation,
+            changes: Vec::new(),
+            destructive_checkpoint: None,
+            savepoints: Vec::new(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -607,15 +634,14 @@ impl TurboVecTable {
             state: Mutex::new(State {
                 generation,
                 index,
-                transaction_snapshot: None,
-                savepoints: Vec::new(),
+                transaction: None,
                 dirty: false,
             }),
         })
     }
 
     fn refresh<'a>(&self, state: &'a mut State) -> Result<&'a mut State> {
-        if state.dirty {
+        if state.transaction.is_some() {
             return Ok(state);
         }
         let connection = connection(self.db)?;
@@ -659,14 +685,101 @@ impl TurboVecTable {
         validate_geometry(&index, dimensions, bit_width)
     }
 
-    fn mutate(&self, operation: impl FnOnce(&mut IdMapIndex) -> Result<()>) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        self.refresh(&mut state)?;
-        operation(&mut state.index)?;
-        state.dirty = true;
+    fn ensure_transaction(state: &mut State) -> &mut TransactionState {
+        state
+            .transaction
+            .get_or_insert_with(|| TransactionState::new(state.generation))
+    }
+
+    fn ensure_destructive_checkpoint(state: &mut State) {
+        let needs_checkpoint = state
+            .transaction
+            .as_ref()
+            .is_none_or(|transaction| transaction.destructive_checkpoint.is_none());
+        if !needs_checkpoint {
+            return;
+        }
+        let payload = state.index.to_bytes();
+        let transaction = Self::ensure_transaction(state);
+        transaction.destructive_checkpoint = Some(DestructiveCheckpoint {
+            change_index: transaction.changes.len(),
+            payload,
+        });
+    }
+
+    fn replay(index: &mut IdMapIndex, changes: &[Change]) -> Result<()> {
+        for change in changes {
+            match change {
+                Change::Insert { id, vector } => {
+                    let vector = vector.as_ref().ok_or_else(|| {
+                        error("turbovec0 transaction replay is missing an inserted vector")
+                    })?;
+                    if index.contains(*id) {
+                        index.remove(*id);
+                    }
+                    index.add_with_ids(vector, &[*id]).map_err(|cause| {
+                        error(format!("cannot replay inserted vector: {cause}"))
+                    })?;
+                }
+                Change::Delete { id } => {
+                    if !index.remove(*id) {
+                        return Err(error(format!(
+                            "cannot replay deletion of missing turbovec0 rowid {id}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn undo_insert_prefix(index: &mut IdMapIndex, changes: &[Change]) -> Result<()> {
+        for change in changes.iter().rev() {
+            let Change::Insert { id, vector: None } = change else {
+                return Err(error(
+                    "turbovec0 transaction prefix contains a destructive change",
+                ));
+            };
+            if !index.remove(*id) {
+                return Err(error(format!(
+                    "cannot undo insertion of missing turbovec0 rowid {id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_to(state: &mut State, change_index: usize) -> Result<()> {
+        let mut transaction = state
+            .transaction
+            .take()
+            .ok_or_else(|| error("turbovec0 has no active transaction"))?;
+        if change_index > transaction.changes.len() {
+            state.transaction = Some(transaction);
+            return Err(error("invalid turbovec0 savepoint change index"));
+        }
+
+        if let Some(checkpoint) = transaction.destructive_checkpoint.take() {
+            state.index = IdMapIndex::from_bytes(&checkpoint.payload)
+                .map_err(|cause| error(format!("cannot restore turbovec0 checkpoint: {cause}")))?;
+            if change_index < checkpoint.change_index {
+                Self::undo_insert_prefix(
+                    &mut state.index,
+                    &transaction.changes[change_index..checkpoint.change_index],
+                )?;
+            } else {
+                Self::replay(
+                    &mut state.index,
+                    &transaction.changes[checkpoint.change_index..change_index],
+                )?;
+                transaction.destructive_checkpoint = Some(checkpoint);
+            }
+        } else {
+            Self::undo_insert_prefix(&mut state.index, &transaction.changes[change_index..])?;
+        }
+        transaction.changes.truncate(change_index);
+        state.dirty = !transaction.changes.is_empty();
+        state.transaction = Some(transaction);
         Ok(())
     }
 
@@ -675,10 +788,11 @@ impl TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        let payload = state.index.to_bytes();
-        let dirty = state.dirty;
-        state.savepoints.retain(|(existing, _, _)| *existing < id);
-        state.savepoints.push((id, payload, dirty));
+        let transaction = Self::ensure_transaction(&mut state);
+        transaction
+            .savepoints
+            .retain(|(existing, _)| *existing < id);
+        transaction.savepoints.push((id, transaction.changes.len()));
         Ok(())
     }
 
@@ -687,7 +801,13 @@ impl TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        state.savepoints.retain(|(existing, _, _)| *existing < id);
+        let transaction = state
+            .transaction
+            .as_mut()
+            .ok_or_else(|| error("turbovec0 has no active transaction"))?;
+        transaction
+            .savepoints
+            .retain(|(existing, _)| *existing < id);
         Ok(())
     }
 
@@ -696,17 +816,23 @@ impl TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        let (_, payload, dirty) = state
+        let change_index = state
+            .transaction
+            .as_ref()
+            .ok_or_else(|| error("turbovec0 has no active transaction"))?
             .savepoints
             .iter()
             .rev()
-            .find(|(existing, _, _)| *existing == id)
-            .cloned()
+            .find(|(existing, _)| *existing == id)
+            .map(|(_, change_index)| *change_index)
             .ok_or_else(|| error(format!("unknown turbovec0 savepoint {id}")))?;
-        state.index = IdMapIndex::from_bytes(&payload)
-            .map_err(|cause| error(format!("cannot restore savepoint: {cause}")))?;
-        state.dirty = dirty;
-        state.savepoints.retain(|(existing, _, _)| *existing <= id);
+        Self::restore_to(&mut state, change_index)?;
+        state
+            .transaction
+            .as_mut()
+            .expect("restore_to preserves the transaction")
+            .savepoints
+            .retain(|(existing, _)| *existing <= id);
         Ok(())
     }
 }
@@ -899,13 +1025,26 @@ impl UpdateVTab<'_> for TurboVecTable {
             .as_i64()
             .map_err(|_| error("rowid must be a SQLite INTEGER"))?;
         let id = u64::try_from(id).map_err(|_| error("rowid must be non-negative"))?;
-        self.mutate(|index| {
-            if index.remove(id) {
-                Ok(())
-            } else {
-                Err(error(format!("unknown turbovec0 rowid {id}")))
-            }
-        })
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| error("turbovec0 state lock is poisoned"))?;
+        self.refresh(&mut state)?;
+        if !state.index.contains(id) {
+            return Err(error(format!("unknown turbovec0 rowid {id}")));
+        }
+        Self::ensure_destructive_checkpoint(&mut state);
+        if !state.index.remove(id) {
+            return Err(error(format!("unknown turbovec0 rowid {id}")));
+        }
+        state
+            .transaction
+            .as_mut()
+            .expect("destructive checkpoint creates a transaction")
+            .changes
+            .push(Change::Delete { id });
+        state.dirty = true;
+        Ok(())
     }
 
     fn insert(&mut self, args: &Inserts<'_>) -> Result<i64> {
@@ -922,14 +1061,12 @@ impl UpdateVTab<'_> for TurboVecTable {
             )));
         }
         let conflict = unsafe { args.on_conflict(self.db) };
-        let exists = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-            self.refresh(&mut state)?;
-            state.index.contains(id)
-        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| error("turbovec0 state lock is poisoned"))?;
+        self.refresh(&mut state)?;
+        let exists = state.index.contains(id);
         if exists && conflict == ConflictMode::Ignore {
             return Ok(rowid);
         }
@@ -939,14 +1076,26 @@ impl UpdateVTab<'_> for TurboVecTable {
                 format!("turbovec0 rowid {id} already exists"),
             ));
         }
-        self.mutate(|index| {
-            if exists && conflict == ConflictMode::Replace {
-                index.remove(id);
-            }
-            index
-                .add_with_ids(&vector, &[id])
-                .map_err(|cause| error(format!("cannot insert vector: {cause}")))
-        })?;
+        if exists {
+            Self::ensure_destructive_checkpoint(&mut state);
+            state.index.remove(id);
+        } else {
+            Self::ensure_transaction(&mut state);
+        }
+        state
+            .index
+            .add_with_ids(&vector, &[id])
+            .map_err(|cause| error(format!("cannot insert vector: {cause}")))?;
+        let transaction = state
+            .transaction
+            .as_mut()
+            .expect("insert creates a transaction");
+        let replay_vector = transaction.destructive_checkpoint.as_ref().map(|_| vector);
+        transaction.changes.push(Change::Insert {
+            id,
+            vector: replay_vector,
+        });
+        state.dirty = true;
         Ok(rowid)
     }
 
@@ -1008,10 +1157,9 @@ impl TransactionVTab<'_> for TurboVecTable {
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
         self.refresh(&mut state)?;
-        if state.transaction_snapshot.is_none() {
-            state.transaction_snapshot = Some((state.generation, state.index.to_bytes()));
+        if state.transaction.is_none() {
+            state.transaction = Some(TransactionState::new(state.generation));
         }
-        state.savepoints.clear();
         Ok(())
     }
 
@@ -1047,8 +1195,10 @@ impl TransactionVTab<'_> for TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        state.transaction_snapshot = None;
-        state.savepoints.clear();
+        if state.dirty {
+            return Err(error("turbovec0 commit reached before xSync"));
+        }
+        state.transaction = None;
         state.dirty = false;
         Ok(())
     }
@@ -1058,12 +1208,14 @@ impl TransactionVTab<'_> for TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        if let Some((generation, payload)) = state.transaction_snapshot.take() {
-            state.index = IdMapIndex::from_bytes(&payload)
-                .map_err(|cause| error(format!("cannot restore rolled-back index: {cause}")))?;
-            state.generation = generation;
-        }
-        state.savepoints.clear();
+        let Some(transaction) = state.transaction.as_ref() else {
+            state.dirty = false;
+            return Ok(());
+        };
+        let start_generation = transaction.start_generation;
+        Self::restore_to(&mut state, 0)?;
+        state.transaction = None;
+        state.generation = start_generation;
         state.dirty = false;
         Ok(())
     }
