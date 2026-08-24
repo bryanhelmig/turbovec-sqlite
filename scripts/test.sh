@@ -82,6 +82,7 @@ then
   done
   python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
+  python3 -X faulthandler tests/recall_fixture.py "$extension"
   python3 -X faulthandler tests/savepoint_cost.py "$extension"
 else
   python_sqlite_version=$(python3 -c 'import sqlite3; print(sqlite3.sqlite_version)')
@@ -129,6 +130,33 @@ if "$sqlite_bin" "$database" \
    select * from forbidden_turbovec_use" >/dev/null 2>&1
 then
   echo "Expected DIRECTONLY virtual-table use from a view to fail" >&2
+  exit 1
+fi
+
+if "$sqlite_bin" "$database" \
+  -cmd ".load $extension" \
+  "select turbovec_info('documents')" >/dev/null 2>&1
+then
+  echo "Expected turbovec_info() to reject a non-turbovec0 table" >&2
+  exit 1
+fi
+
+format_database="$test_dir/newer-format.db"
+cp "$database" "$format_database"
+"$sqlite_bin" "$format_database" \
+  "update renamed_vectors_chunks
+     set data=cast(substr(data, 1, 4) || x'03' || substr(data, 6) as blob)
+   where chunk_id=0;
+   update renamed_vectors_meta set generation=generation+1;"
+format_error=$(
+  "$sqlite_bin" "$format_database" \
+    -cmd ".load $extension" \
+    "select count(*) from renamed_vectors" 2>&1 || true
+)
+if [[ "$format_error" != *"unsupported TurboVec format v7 revision 3"* ]] || \
+   [[ "$format_error" != *"requires revision 2"* ]]
+then
+  echo "Expected a clear newer-format refusal, got: $format_error" >&2
   exit 1
 fi
 
