@@ -42,7 +42,8 @@ def main() -> None:
         assert cause.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
     else:
         raise AssertionError("duplicate ABORT insert unexpectedly succeeded")
-    assert ids(connection) == [1]
+    actual_ids = ids(connection)
+    assert actual_ids == [1], actual_ids
 
     # FAIL deliberately preserves rows completed before the constraint.
     try:
@@ -55,7 +56,8 @@ def main() -> None:
         pass
     else:
         raise AssertionError("duplicate FAIL insert unexpectedly succeeded")
-    assert ids(connection) == [1, 3]
+    actual_ids = ids(connection)
+    assert actual_ids == [1, 3], actual_ids
     connection.commit()
 
     # ROLLBACK unwinds the whole explicit transaction, including prior SQL.
