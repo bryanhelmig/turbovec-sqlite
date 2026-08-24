@@ -40,6 +40,7 @@ const PLAN_ROWID_FILTER_IN: c_int = 0x100;
 // sqlite3_api_routines pointer slots from SQLite's stable sqlite3ext.h ABI.
 // The IN callbacks were appended in SQLite 3.38; this project supports 3.44+.
 const API_LIBVERSION_NUMBER: usize = 67;
+const API_VTAB_CONFIG: usize = 177;
 const API_VTAB_IN: usize = 259;
 const API_VTAB_IN_FIRST: usize = 260;
 const API_VTAB_IN_NEXT: usize = 261;
@@ -60,6 +61,7 @@ type IntegrityCallback = unsafe extern "C" fn(
     c_int,
     *mut *mut c_char,
 ) -> c_int;
+type VtabConfigCallback = unsafe extern "C" fn(*mut ffi::sqlite3, c_int, ...) -> c_int;
 type VtabInCallback = unsafe extern "C" fn(*mut ffi::sqlite3_index_info, c_int, c_int) -> c_int;
 type VtabInIterCallback =
     unsafe extern "C" fn(*mut ffi::sqlite3_value, *mut *mut ffi::sqlite3_value) -> c_int;
@@ -72,6 +74,7 @@ struct ModuleV4 {
 
 static ORIGINAL_BEST_INDEX: OnceLock<usize> = OnceLock::new();
 static ORIGINAL_FILTER: OnceLock<usize> = OnceLock::new();
+static VTAB_CONFIG: OnceLock<usize> = OnceLock::new();
 static VTAB_IN: OnceLock<usize> = OnceLock::new();
 static VTAB_IN_FIRST: OnceLock<usize> = OnceLock::new();
 static VTAB_IN_NEXT: OnceLock<usize> = OnceLock::new();
@@ -97,6 +100,7 @@ pub(crate) unsafe fn initialize_api(api: *mut ffi::sqlite3_api_routines) {
         return;
     }
     for (slot, destination) in [
+        (API_VTAB_CONFIG, &VTAB_CONFIG),
         (API_VTAB_IN, &VTAB_IN),
         (API_VTAB_IN_FIRST, &VTAB_IN_FIRST),
         (API_VTAB_IN_NEXT, &VTAB_IN_NEXT),
@@ -552,7 +556,18 @@ struct TurboVecTable {
 
 impl TurboVecTable {
     fn configure(db: &mut VTabConnection) -> Result<()> {
-        db.config(VTabConfig::ConstraintSupport)?;
+        // SQLITE_VTAB_CONSTRAINT_SUPPORT is the only config option here with
+        // a variadic third argument. Rusqlite 0.40's convenience method omits
+        // it, so call the host API-table function directly.
+        let pointer = *VTAB_CONFIG
+            .get()
+            .ok_or_else(|| error("SQLite virtual-table config callback is unavailable"))?;
+        let callback: VtabConfigCallback = unsafe { std::mem::transmute(pointer) };
+        let result =
+            unsafe { callback(db.handle(), ffi::SQLITE_VTAB_CONSTRAINT_SUPPORT, 1 as c_int) };
+        if result != ffi::SQLITE_OK {
+            return Err(Error::SqliteFailure(ffi::Error::new(result), None));
+        }
         db.config(VTabConfig::DirectOnly)
     }
 

@@ -103,7 +103,9 @@ by bit width.
 Rusqlite 0.40 does not expose savepoint, shadow-name, or integrity module
 callbacks through its builder. This crate pins 0.40.2 and locally fills those
 callbacks in its `sqlite3_module`. That small compatibility seam should be
-removed when Rusqlite exposes them.
+removed when Rusqlite exposes them. Its configuration wrapper also omits the
+variadic value required by `SQLITE_VTAB_CONSTRAINT_SUPPORT`, so this crate
+calls that host API-table function directly.
 
 ## Current limits
 
