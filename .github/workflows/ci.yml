@@ -275,6 +275,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             release-assets/*.tar.gz \
             release-assets/*.sha256 \
-            --generate-notes \
+            --notes-file CHANGELOG.md \
             --verify-tag \
             --title "turbovec-sqlite $GITHUB_REF_NAME"
