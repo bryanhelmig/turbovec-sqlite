@@ -18,7 +18,7 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error, Result, params};
 use turbovec::IdMapIndex;
 
-use crate::parse_vector;
+use crate::{TURBOVEC_FORMAT_REVISION, TURBOVEC_FORMAT_VERSION, check_format, parse_vector};
 
 const MODULE_NAME: &CStr = c"turbovec0";
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -402,7 +402,7 @@ fn read_generation(connection: &Connection, meta: &str) -> Result<i64> {
     )
 }
 
-fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, IdMapIndex)> {
+fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, Vec<u8>)> {
     let (generation, expected_len): (i64, i64) = connection.query_row(
         &format!("SELECT generation, byte_len FROM {meta} WHERE id=1"),
         [],
@@ -428,9 +428,66 @@ fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64,
             payload.len()
         )));
     }
+    Ok((generation, payload))
+}
+
+fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, IdMapIndex)> {
+    let (generation, payload) = read_payload(connection, meta, chunks)?;
+    check_format(&payload)
+        .map_err(|cause| error(format!("cannot open turbovec0 index: {cause}")))?;
     let index = IdMapIndex::from_bytes(&payload)
         .map_err(|cause| error(format!("invalid chunked TurboVec index: {cause}")))?;
     Ok((generation, index))
+}
+
+pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Result<String> {
+    let (database, table) = match qualified_table.split_once('.') {
+        Some((database, table)) if !database.is_empty() && !table.is_empty() => (database, table),
+        None if !qualified_table.is_empty() => ("main", qualified_table),
+        _ => {
+            return Err(error(
+                "turbovec_info() expects a table name or schema.table",
+            ));
+        }
+    };
+    if table.contains('.') {
+        return Err(error(
+            "turbovec_info() expects a table name or schema.table",
+        ));
+    }
+
+    let schema = format!("{}.sqlite_schema", quote(database));
+    let create_sql: String = connection
+        .query_row(
+            &format!("SELECT sql FROM {schema} WHERE type='table' AND name=?1"),
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(|_| error(format!("unknown SQLite table {qualified_table}")))?;
+    let normalized = create_sql.to_ascii_lowercase();
+    if !normalized.contains("using turbovec0") {
+        return Err(error(format!(
+            "SQLite table {qualified_table} is not a turbovec0 virtual table"
+        )));
+    }
+
+    let (meta, chunks) = names_str(database, table);
+    let (generation, payload) = read_payload(connection, &meta, &chunks)?;
+    check_format(&payload)
+        .map_err(|cause| error(format!("cannot inspect turbovec0 index: {cause}")))?;
+    let index = IdMapIndex::from_bytes(&payload)
+        .map_err(|cause| error(format!("invalid chunked TurboVec index: {cause}")))?;
+    Ok(serde_json::json!({
+        "table": qualified_table,
+        "generation": generation,
+        "count": index.len(),
+        "bit_width": index.bit_width(),
+        "dimensions": index.dim_opt(),
+        "serialized_bytes": payload.len(),
+        "format_version": TURBOVEC_FORMAT_VERSION,
+        "format_revision": TURBOVEC_FORMAT_REVISION,
+    })
+    .to_string())
 }
 
 fn write_index(

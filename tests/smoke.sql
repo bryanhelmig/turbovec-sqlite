@@ -2,7 +2,7 @@
 
 create table assertions(ok integer not null check(ok));
 
-insert into assertions values (turbovec_version() = '0.1.2');
+insert into assertions values (turbovec_version() = '0.1.3');
 insert into assertions values (length(turbovec_f32('[1, 2, 3]')) = 12);
 
 create table documents(
@@ -67,6 +67,16 @@ select id, embedding from documents;
 
 insert into assertions values ((select count(*) from document_vectors) = 3);
 insert into assertions values ((select generation from document_vectors_meta) = 1);
+insert into assertions
+select json_extract(info, '$.table') = 'document_vectors'
+   and json_extract(info, '$.generation') = 1
+   and json_extract(info, '$.count') = 3
+   and json_extract(info, '$.bit_width') = 4
+   and json_extract(info, '$.dimensions') = 8
+   and json_extract(info, '$.serialized_bytes') > 0
+   and json_extract(info, '$.format_version') = 7
+   and json_extract(info, '$.format_revision') = 2
+from (select turbovec_info('document_vectors') as info);
 insert into assertions
 select count(*) = 2
 from pragma_table_list

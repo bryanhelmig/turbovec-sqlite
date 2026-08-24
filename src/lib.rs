@@ -23,6 +23,9 @@ use rusqlite::{Connection, Error, Result};
 use turbovec::IdMapIndex;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const TURBOVEC_FORMAT_MAGIC: &[u8; 4] = b"TV7\0";
+const TURBOVEC_FORMAT_VERSION: u8 = 7;
+const TURBOVEC_FORMAT_REVISION: u8 = 2;
 const MODULE_NAME: &CStr = c"turbovec_knn";
 
 const COL_ID: c_int = 0;
@@ -103,7 +106,27 @@ fn vector_blob(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
+fn check_format(bytes: &[u8]) -> std::result::Result<(), String> {
+    let Some(header) = bytes.get(..5) else {
+        return Err("TurboVec index is too short to contain a format header".to_owned());
+    };
+    if &header[..4] != TURBOVEC_FORMAT_MAGIC {
+        return Err(
+            "unsupported TurboVec index format; this extension requires format v7".to_owned(),
+        );
+    }
+    if header[4] != TURBOVEC_FORMAT_REVISION {
+        return Err(format!(
+            "unsupported TurboVec format v{TURBOVEC_FORMAT_VERSION} revision {}; \
+             this extension requires revision {TURBOVEC_FORMAT_REVISION}",
+            header[4]
+        ));
+    }
+    Ok(())
+}
+
 fn load_index(bytes: &[u8]) -> Result<IdMapIndex> {
+    check_format(bytes).map_err(function_error)?;
     IdMapIndex::from_bytes(bytes)
         .map_err(|error| function_error(format!("invalid TurboVec index BLOB: {error}")))
 }
@@ -123,6 +146,12 @@ fn validate_vector_dim(index: &IdMapIndex, vector: &[f32]) -> Result<()> {
 
 fn version(_ctx: &FunctionContext<'_>) -> Result<&'static str> {
     Ok(VERSION)
+}
+
+fn table_info(ctx: &FunctionContext<'_>) -> Result<String> {
+    let table: String = ctx.get(0)?;
+    let connection = unsafe { ctx.get_connection()? };
+    chunked::table_info(&connection, &table)
 }
 
 fn f32_blob(ctx: &FunctionContext<'_>) -> Result<Vec<u8>> {
@@ -380,6 +409,12 @@ fn extension_init(db: Connection) -> Result<bool> {
     let resource_heavy = deterministic | FunctionFlags::SQLITE_DIRECTONLY;
 
     db.create_scalar_function(c"turbovec_version", 0, pure, version)?;
+    db.create_scalar_function(
+        c"turbovec_info",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        table_info,
+    )?;
     db.create_scalar_function(c"turbovec_f32", 1, pure, f32_blob)?;
     db.create_scalar_function(c"turbovec_new", 2, resource_heavy, new_index)?;
     db.create_scalar_function(c"turbovec_add", 3, resource_heavy, add_vector)?;
@@ -400,6 +435,7 @@ fn extension_init(db: Connection) -> Result<bool> {
 /// # Safety
 ///
 /// SQLite calls this with a valid connection, error pointer, and API table.
+#[cfg(feature = "loadable-entrypoint")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_extension_init(
     db: *mut ffi::sqlite3,
@@ -416,14 +452,17 @@ pub unsafe extern "C" fn sqlite3_extension_init(
 ///
 /// # Safety
 ///
-/// Same contract as [`sqlite3_extension_init`].
+/// SQLite calls this with a valid connection, error pointer, and API table.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_turbovec_init(
     db: *mut ffi::sqlite3,
     error_message: *mut *mut c_char,
     api: *mut ffi::sqlite3_api_routines,
 ) -> c_int {
-    unsafe { sqlite3_extension_init(db, error_message, api) }
+    unsafe {
+        chunked::initialize_api(api);
+        Connection::extension_init2(db, error_message, api, extension_init)
+    }
 }
 
 #[cfg(test)]
@@ -460,5 +499,19 @@ mod tests {
         assert!(checked_id(-1).is_err());
         assert_eq!(checked_usize(8, "dimensions").unwrap(), 8);
         assert_eq!(checked_id(42).unwrap(), 42);
+    }
+
+    #[test]
+    fn checks_the_pinned_disk_format_before_deserializing() {
+        let bytes = IdMapIndex::new(8, 4).unwrap().to_bytes();
+        assert_eq!(&bytes[..4], TURBOVEC_FORMAT_MAGIC);
+        assert_eq!(bytes[4], TURBOVEC_FORMAT_REVISION);
+        check_format(&bytes).unwrap();
+
+        let mut newer = bytes;
+        newer[4] = TURBOVEC_FORMAT_REVISION + 1;
+        let message = check_format(&newer).unwrap_err();
+        assert!(message.contains("unsupported TurboVec format v7 revision 3"));
+        assert!(message.contains("requires revision 2"));
     }
 }

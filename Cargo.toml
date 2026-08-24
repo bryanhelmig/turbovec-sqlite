@@ -1,6 +1,6 @@
 [package]
 name = "turbovec-sqlite"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.89"
 description = "Experimental TurboVec loadable extension for SQLite"
@@ -11,8 +11,12 @@ keywords = ["sqlite", "vector-search", "extension", "embeddings"]
 categories = ["database", "database-implementations"]
 publish = false
 
+[features]
+default = ["loadable-entrypoint"]
+loadable-entrypoint = []
+
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
 # The virtual-table module fills callbacks that Rusqlite 0.40 does not expose.
