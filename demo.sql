@@ -1,8 +1,12 @@
-create table documents(id integer primary key, body text not null);
+create table documents(
+  id integer primary key,
+  path text not null,
+  body text not null
+);
 insert into documents values
-  (1, 'east'),
-  (2, 'north'),
-  (3, 'near east');
+  (1, 'config/east.yaml', 'east'),
+  (2, 'notes/north.txt', 'north'),
+  (3, 'config/near-east.yaml', 'near east');
 
 create virtual table document_vectors using turbovec0(
   dimensions=8,
@@ -26,3 +30,13 @@ select d.id, d.body, round(matches.score, 4) as score
 from matches
 join documents as d on d.id = matches.rowid
 order by matches.score desc;
+
+-- The rowid subquery is pushed into the compressed scan.
+select rowid, round(score, 4) as rounded_score
+from document_vectors
+where embedding match '[1, 0, 0, 0, 0, 0, 0, 0]'
+  and rowid in (
+    select id from documents where path glob '*.yaml'
+  )
+order by score desc
+limit 2;

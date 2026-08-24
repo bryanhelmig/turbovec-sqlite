@@ -141,3 +141,16 @@ rejected it before benchmarking because `INSERT OR FAIL` must preserve earlier
 rows from the same statement. A future optimization needs a genuinely cheap
 in-memory snapshot or incremental TurboVec persistence; batching writes is the
 correct current advice.
+
+## Pooled-connection cache follow-up
+
+An immutable process-wide cache was prototyped after the allowlist work. On a
+20,000-row, 1,536-dimensional index, the first reader loaded in 8.82 ms and two
+sibling connections warmed in 0.40 ms and 0.28 ms. After a writer committed,
+the first reader reloaded in 7.65 ms and the siblings reused that generation in
+0.24 ms and 0.20 ms.
+
+The prototype was rejected. Shared-state changes made the `INSERT OR FAIL`
+savepoint test sensitive to otherwise irrelevant code-layout and diagnostic
+changes. A retained cache needs a minimal reproducer, concurrent cold-start
+coverage, rollback/savepoint tests, and a pooled memory/load benchmark.

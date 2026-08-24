@@ -7,6 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
+use rusqlite::fallible_iterator::FallibleIterator as _;
 use rusqlite::ffi;
 use rusqlite::types::{Null, ValueRef};
 use rusqlite::vtab::{
@@ -33,6 +34,8 @@ const PLAN_KIND_MASK: c_int = 0x0f;
 const PLAN_HAS_K: c_int = 0x10;
 const PLAN_HAS_LIMIT: c_int = 0x20;
 const PLAN_HAS_OFFSET: c_int = 0x40;
+const PLAN_HAS_ROWID_FILTER: c_int = 0x80;
+const PLAN_ROWID_FILTER_IN: c_int = 0x100;
 
 pub(crate) fn register(connection: &Connection) -> Result<()> {
     let result = unsafe {
@@ -52,22 +55,6 @@ pub(crate) fn register(connection: &Connection) -> Result<()> {
 }
 
 fn raw_module() -> *const ffi::sqlite3_module {
-    type IntegrityCallback = unsafe extern "C" fn(
-        *mut ffi::sqlite3_vtab,
-        *const c_char,
-        *const c_char,
-        c_int,
-        *mut *mut c_char,
-    ) -> c_int;
-
-    #[repr(C)]
-    struct ModuleV4 {
-        module: ffi::sqlite3_module,
-        // The loadable-extension bindings expose the v3 prefix. SQLite 3.44
-        // appended xIntegrity for v4, so keep that ABI field explicitly.
-        x_integrity: Option<IntegrityCallback>,
-    }
-
     static MODULE_POINTER: OnceLock<usize> = OnceLock::new();
     let pointer = *MODULE_POINTER.get_or_init(|| {
         const RUSQLITE_MODULE: Module<TurboVecTable> = Module::update_module_with_tx();
@@ -82,10 +69,7 @@ fn raw_module() -> *const ffi::sqlite3_module {
         module.xRelease = Some(release);
         module.xRollbackTo = Some(rollback_to);
         module.xShadowName = Some(shadow_name);
-        let module = ModuleV4 {
-            module,
-            x_integrity: Some(integrity),
-        };
+        module.xIntegrity = Some(integrity);
         Box::into_raw(Box::new(module)) as usize
     });
     pointer as *const ffi::sqlite3_module
@@ -572,16 +556,26 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
 
     fn best_index(&self, info: &mut IndexInfo) -> Result<bool> {
         let mut rowid = None;
+        let mut rowid_is_in = false;
         let mut query = None;
+        let mut unusable_query = false;
         let mut k = None;
         let mut limit = None;
         let mut offset = None;
         for (index, constraint) in info.constraints().enumerate() {
             if !constraint.is_usable() {
+                if constraint.column() == COL_EMBEDDING
+                    && constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_MATCH
+                {
+                    unusable_query = true;
+                }
                 continue;
             }
             match (constraint.column(), constraint.operator()) {
-                (-1, IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ) => rowid = Some(index),
+                (-1, IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ) => {
+                    rowid = Some(index);
+                    rowid_is_in = info.is_in_constraint(index)?;
+                }
                 (COL_EMBEDDING, IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_MATCH) => {
                     query = Some(index)
                 }
@@ -600,14 +594,19 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
 
         if let Some(query) = query {
             if k.is_none() && limit.is_none() {
-                return Ok(false);
+                return Err(error(
+                    "turbovec0 MATCH requires a single-table scan with ORDER BY score DESC LIMIT n \
+                     (or hidden k=n); bind the query or use a scalar subquery before joining",
+                ));
             }
             // LIMIT defines the TurboVec candidate count only for nearest-first
             // ordering. Otherwise fetching LIMIT winners and letting SQLite
             // reorder that subset would produce a plausible but incorrect
             // global result.
             if limit.is_some() && !ordered_by_score_desc {
-                return Ok(false);
+                return Err(error(
+                    "turbovec0 LIMIT requires ORDER BY the unmodified score column DESC",
+                ));
             }
             let mut query_usage = info.constraint_usage(query);
             query_usage.set_argv_index(1);
@@ -636,16 +635,38 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
                 // SQLite still applies OFFSET after the module produces
                 // LIMIT+OFFSET candidates.
                 usage.set_omit(false);
+                argument += 1;
                 plan |= PLAN_HAS_OFFSET;
+            }
+            if let Some(rowid) = rowid {
+                if rowid_is_in && !info.set_in_constraint(rowid, true)? {
+                    return Ok(false);
+                }
+                let mut usage = info.constraint_usage(rowid);
+                usage.set_argv_index(argument);
+                usage.set_omit(true);
+                plan |= PLAN_HAS_ROWID_FILTER;
+                if rowid_is_in {
+                    plan |= PLAN_ROWID_FILTER_IN;
+                }
             }
             info.set_order_by_consumed(ordered_by_score_desc);
             info.set_idx_num(plan);
+            info.set_idx_str(if rowid.is_some() {
+                "knn+rowid-allowlist"
+            } else {
+                "knn"
+            });
             info.set_estimated_cost(
                 self.state
                     .lock()
                     .map_or(1_000_000.0, |s| s.index.len() as f64),
             );
             info.set_estimated_rows(10);
+        } else if unusable_query {
+            return Err(error(
+                "turbovec0 MATCH query is not constant for this scan; use a bound value or scalar subquery",
+            ));
         } else if let Some(rowid) = rowid {
             let mut usage = info.constraint_usage(rowid);
             usage.set_argv_index(1);
@@ -938,9 +959,43 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
                 };
                 let offset = if plan & PLAN_HAS_OFFSET != 0 {
                     let value: i64 = args.get(argument)?;
+                    argument += 1;
                     usize::try_from(value).unwrap_or(0)
                 } else {
                     0
+                };
+                let allowlist = if plan & PLAN_HAS_ROWID_FILTER != 0 {
+                    let mut ids = Vec::new();
+                    if plan & PLAN_ROWID_FILTER_IN != 0 {
+                        let mut values = args.in_values(argument)?;
+                        while let Some(value) = values.next()? {
+                            match value {
+                                ValueRef::Integer(value) => {
+                                    if let Ok(id) = u64::try_from(value)
+                                        && state.index.contains(id)
+                                    {
+                                        ids.push(id);
+                                    }
+                                }
+                                ValueRef::Null => {}
+                                _ => {
+                                    return Err(error(
+                                        "rowid allowlist values must be SQLite INTEGERs",
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        let value: i64 = args.get(argument)?;
+                        if let Ok(id) = u64::try_from(value)
+                            && state.index.contains(id)
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    Some(ids)
+                } else {
+                    None
                 };
                 let limit_with_offset = limit
                     .map(|limit| limit.saturating_add(offset))
@@ -949,9 +1004,12 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
                     .map(|k| k.min(limit_with_offset))
                     .unwrap_or(limit_with_offset)
                     .min(state.index.len());
+                if allowlist.as_ref().is_some_and(Vec::is_empty) {
+                    return Ok(());
+                }
                 let results = state
                     .index
-                    .try_search(&query, k)
+                    .try_search_with_allowlist(&query, k, allowlist.as_deref())
                     .map_err(|cause| error(format!("TurboVec search failed: {cause}")))?;
                 results
                     .ids

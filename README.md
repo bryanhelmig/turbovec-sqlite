@@ -15,8 +15,7 @@ index file.
 
 > [!IMPORTANT]
 > `turbovec-sqlite` is experimental and pre-v1. Expect breaking changes in the
-> SQL interface and on-disk format. It is not yet published as a crate or a set
-> of release binaries.
+> SQL interface and on-disk format. Pin a release before shipping it.
 
 - Writable, transaction-aware `turbovec0` virtual tables
 - Approximate inner-product search over aggressively compressed vectors
@@ -42,8 +41,9 @@ vectors, inner-product and cosine-similarity rankings are equivalent.
 
 ## Installing
 
-For now, build the extension from a source checkout. It requires Rust 1.89 or
-newer and SQLite 3.44 or newer with loadable-extension support.
+Download the archive for your operating system and architecture from the
+repository's Releases page, or build from source. Source builds require Rust
+1.89 or newer and SQLite 3.44 or newer with loadable-extension support.
 
 ```sh
 git clone https://github.com/bryanhelmig/turbovec-sqlite.git
@@ -110,19 +110,40 @@ Vectors may be JSON arrays or little-endian float32 BLOBs. `turbovec_f32()`
 converts JSON to the BLOB form. Dimensions must be a positive multiple of 8.
 
 KNN queries using `LIMIT` require `ORDER BY score DESC`. Put the KNN query in a
-CTE or subquery before joining it to a content table, as shown in
-[`demo.sql`](demo.sql).
+CTE or subquery before joining it to a content table. When the query vector
+comes from SQL, use a scalar subquery: `embedding MATCH (SELECT embedding FROM
+query)`. A joined column on the right of `MATCH` is not a usable virtual-table
+constraint. See [`demo.sql`](demo.sql).
+
+Filter candidates with ordinary SQL rowids:
+
+```sql
+select rowid, score
+from document_vectors
+where embedding match :query
+  and rowid in (
+    select id from documents where path glob '*.yaml'
+  )
+order by score desc
+limit 10;
+```
+
+SQLite passes the integer rowids into the compressed scan. This returns the
+true top 10 among those rowids under TurboVec's approximate score. Do not fetch
+10x candidates and filter afterward: fixed overfetch cannot guarantee enough
+eligible results.
 
 ## Writes and transactions
 
-Use explicit non-negative rowids. `INSERT` and `DELETE` are supported. To
-replace a vector, delete it and insert its replacement; `UPDATE` is rejected.
+Use explicit non-negative rowids. `INSERT`, `INSERT OR REPLACE`, and `DELETE`
+are supported. Ordinary `UPDATE` is rejected.
 
 Batch writes in one transaction:
 
 ```sql
 begin immediate;
 insert into document_vectors(rowid, embedding) values (4, :embedding);
+insert or replace into document_vectors(rowid, embedding) values (1, :replacement);
 delete from document_vectors where rowid = 2;
 commit;
 ```
@@ -177,9 +198,11 @@ methodology, full results, and limitations.
 - Contentless virtual tables: keep documents and source vectors separately.
 - Dimensions must be a positive multiple of 8.
 - Rowids must be explicit, unique, non-negative integers.
-- Inserts and deletes are supported; updates are delete-then-insert.
+- Inserts, deletes, and `INSERT OR REPLACE` are supported; ordinary updates are
+  not.
 - Search is approximate and bit width is an application-level recall choice.
-- There is no SQL metadata/allowlist pushdown yet.
+- Allowlist pushdown accepts integer rowids; express metadata filters as a
+  rowid subquery.
 - Commits still serialize the complete warmed index before comparing chunks.
 - One native library is required for each operating system and architecture.
 - The SQL interface and serialized format are not yet stable.
@@ -192,13 +215,14 @@ Run the core extension suite and exact-baseline comparison with:
 ./scripts/test.sh
 ./scripts/compare_sqlite_vec.sh
 ./scripts/write_score.sh
+./scripts/allowlist_bench.sh
 ./scripts/test_clients.sh
 ```
 
 The suite covers the extension ABI, persistence, transactions, savepoints,
 conflict policies, WAL readers, rename, defensive mode, integrity checks,
-randomized transaction models, cross-language loading, and exact-search
-oracles.
+rowid allowlists, randomized transaction models, cross-language loading, and
+exact-search oracles.
 
 CI tests the declared Rust 1.89 minimum and current stable Rust. It builds,
 lints, tests, and packages the extension for Linux and macOS on x86-64 and
@@ -211,9 +235,8 @@ Build a release archive locally with:
 ./scripts/package.sh
 ```
 
-The archive and its SHA-256 checksum are written to `dist/`. Once releases
-begin, a tag named `v<VERSION>` will publish the platform archives through the
-same tested workflow.
+The archive and its SHA-256 checksum are written to `dist/`. A tag named
+`v<VERSION>` publishes the platform archives through the same tested workflow.
 
 ## Advanced BLOB API
 

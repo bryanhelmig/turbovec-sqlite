@@ -89,16 +89,44 @@ def main() -> None:
 
     # Ordinary LIMIT is only valid for nearest-first ordering. Accepting an
     # ascending or unordered LIMIT would rank only a truncated candidate set.
-    for invalid_query in (
-        "select rowid from v where embedding match ? limit 1",
-        "select rowid from v where embedding match ? order by score asc limit 1",
-    ):
+    invalid_queries = (
+        (
+            "select rowid from v where embedding match ? limit 1",
+            "unmodified score column DESC",
+        ),
+        (
+            "select rowid from v where embedding match ? order by score asc limit 1",
+            "unmodified score column DESC",
+        ),
+        (
+            "select count(*) from v where embedding match ?",
+            "single-table scan",
+        ),
+        (
+            "select rowid, round(score, 2) as score from v "
+            "where embedding match ? order by score desc limit 1",
+            "single-table scan",
+        ),
+        (
+            "with q(embedding) as (values (?)) select v.rowid from v, q "
+            "where v.embedding match q.embedding order by v.score desc limit 1",
+            "scalar subquery",
+        ),
+    )
+    for invalid_query, expected_message in invalid_queries:
         try:
             connection.execute(invalid_query, (VECTOR_X,)).fetchall()
-        except sqlite3.DatabaseError:
-            pass
+        except sqlite3.DatabaseError as cause:
+            assert expected_message in str(cause), cause
         else:
             raise AssertionError(f"invalid KNN ordering was accepted: {invalid_query}")
+
+    scalar_query = connection.execute(
+        "select rowid from v where embedding match (select ?) "
+        "order by score desc limit 1",
+        (VECTOR_X,),
+    ).fetchone()
+    assert scalar_query == (1,)
 
     # xShadowName lets defensive mode reject direct writes while xSync may
     # still maintain the tables through the virtual-table implementation.

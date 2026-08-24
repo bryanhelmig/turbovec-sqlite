@@ -80,6 +80,7 @@ then
   for ((run = 1; run <= transaction_repetitions; run++)); do
     python3 -X faulthandler tests/transactions.py "$extension"
   done
+  python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
 else
   python_sqlite_version=$(python3 -c 'import sqlite3; print(sqlite3.sqlite_version)')
