@@ -161,3 +161,61 @@ The prototype was rejected. Shared-state changes made the `INSERT OR FAIL`
 savepoint test sensitive to otherwise irrelevant code-layout and diagnostic
 changes. A retained cache needs a minimal reproducer, concurrent cold-start
 coverage, rollback/savepoint tests, and a pooled memory/load benchmark.
+
+## Streaming commits — September 15, 2026
+
+Version 0.1.5 uses the pinned engine's `write_to_writer` API
+with a 4 MiB buffer and loads one old chunk at a time. This removes the complete
+new serialized buffer and the collection of every old chunk from `xSync`.
+Changed-byte-span BLOB writes and the disk format are preserved. Serialization
+still visits the entire index, and destructive rollback still takes its lazy
+full-index checkpoint.
+
+Baseline: released 0.1.4 at `f67f564`. Candidate: the 0.1.5 implementation
+on `codex/streaming-commits`.
+Apple M1, macOS 26.6.1, SQLite 3.53.4, Rust 1.89.0. Raw measurements and the
+candidate source checksum are in
+[`streaming-commits-20260915.json`](../benchmarks/results/streaming-commits-20260915.json).
+
+### Memory
+
+Three fresh processes per variant, each building 100,000 vectors at 1,536
+dimensions / four bits, committing, then appending one vector and committing.
+Median process peak RSS through the append commit fell from **312.7 MiB to
+174.0 MiB**, a **44.4% reduction**. The three observations were
+312.7/312.9/312.7 MiB before and 174.2/174.0/172.5 MiB after.
+
+This is whole-process memory, including Python, SQLite, and the warm index.
+Inputs are repeated sparse vectors to exercise storage geometry, not a recall
+workload. Reproduce each variant in its own process with:
+
+```sh
+python3 benchmarks/commit_memory.py --extension /path/to/libturbovec_sqlite.dylib
+```
+
+The benchmark reports bytes and supports macOS and Linux. Peak RSS is comparable
+within the same host/environment; these results are not a fleet-capacity claim.
+
+### Write latency and storage
+
+The existing write benchmark ran sequentially for each variant, with five
+repetitions at each shape. Each transaction inserts 100 and deletes 100 vectors.
+
+| Shape | Commit before | Commit after | WAL before/after |
+|---|---:|---:|---:|
+| 50k rows, 384 dimensions | 8.36 ms | 8.66 ms | 32.2 / 32.2 KiB |
+| 100k rows, 768 dimensions | 23.71 ms | 23.69 ms | 56.4 / 56.4 KiB |
+
+Commit latency is effectively unchanged at these shapes. Single-insert
+transaction latency changed from 7.91 to 7.97 ms and from 22.83 to 23.44 ms,
+respectively. These differences are within the existing 5% noise threshold.
+Reopen time did not regress. The retained benefit is lower memory use.
+
+### Correctness
+
+Storage regressions compare streamed shadow bytes with the scalar BLOB writer,
+including replacement and shrinking a multiple-chunk index to empty. They check
+WAL snapshot visibility, explicit/autocommit rowids, corruption rejection, and
+rollback plus retry after a forced failure in the third chunk. The full Python
+suite passed on both SQLite 3.44.0 and 3.53.4; real-embedding recall remained
+0.907 at 10 and 0.922 at 40. Static linking and all three language clients passed.

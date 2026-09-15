@@ -81,6 +81,7 @@ then
     python3 -X faulthandler tests/transactions.py "$extension"
   done
   python3 -X faulthandler tests/allowlist.py "$extension"
+  python3 -X faulthandler tests/storage.py "$extension"
   python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
   python3 -X faulthandler tests/recall_fixture.py "$extension"
   python3 -X faulthandler tests/savepoint_cost.py "$extension"

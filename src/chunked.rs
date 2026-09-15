@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_int};
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -15,7 +16,7 @@ use rusqlite::vtab::{
     Module, TransactionVTab, UpdateVTab, Updates, VTab, VTabConfig, VTabConnection, VTabCursor,
     VTabKind, escape_double_quote, parameter,
 };
-use rusqlite::{Connection, Error, Result, params};
+use rusqlite::{Connection, Error, OptionalExtension, Result, Statement, params};
 use turbovec::IdMapIndex;
 
 use crate::{TURBOVEC_FORMAT_REVISION, TURBOVEC_FORMAT_VERSION, check_format, parse_vector};
@@ -410,17 +411,58 @@ fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i6
     )?;
     let expected_len = usize::try_from(expected_len)
         .map_err(|_| error("negative or oversized persisted TurboVec byte length"))?;
-    let mut statement =
-        connection.prepare(&format!("SELECT data FROM {chunks} ORDER BY chunk_id"))?;
-    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut payload = Vec::with_capacity(expected_len);
-    for row in rows {
-        payload.extend_from_slice(&row?);
-        if payload.len() > expected_len {
+    // Check storage geometry before allocating from untrusted metadata. SQLite
+    // can read BLOB lengths without loading their contents into Rust buffers.
+    let mut statement = connection.prepare(&format!(
+        "SELECT chunk_id, length(data), typeof(data) FROM {chunks} ORDER BY chunk_id"
+    ))?;
+    let mut rows = statement.query([])?;
+    let mut count = 0_i64;
+    let mut actual_len = 0_usize;
+    let mut previous_len = CHUNK_SIZE;
+    while let Some(row) = rows.next()? {
+        let chunk_id: i64 = row.get(0)?;
+        let length: i64 = row.get(1)?;
+        let kind: String = row.get(2)?;
+        if chunk_id != count || previous_len != CHUNK_SIZE {
             return Err(error(
-                "TurboVec chunk payload exceeds its declared byte length",
+                "invalid TurboVec chunk sequence or non-final partial chunk",
             ));
         }
+        let length = usize::try_from(length).map_err(|_| error("invalid TurboVec chunk length"))?;
+        if kind != "blob" || length == 0 || length > CHUNK_SIZE {
+            return Err(error("invalid TurboVec chunk type or length"));
+        }
+        actual_len = actual_len
+            .checked_add(length)
+            .ok_or_else(|| error("oversized TurboVec chunk payload"))?;
+        previous_len = length;
+        count += 1;
+    }
+    if actual_len != expected_len {
+        return Err(error(format!(
+            "TurboVec chunks contain {actual_len} bytes; metadata declares {expected_len}"
+        )));
+    }
+
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(actual_len)
+        .map_err(|_| sqlite_error(ffi::SQLITE_NOMEM, "cannot allocate TurboVec chunk payload"))?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT chunk_id, data FROM {chunks} ORDER BY chunk_id"
+    ))?;
+    let mut rows = statement.query([])?;
+    let mut chunk_id = 0_i64;
+    while let Some(row) = rows.next()? {
+        let stored_id: i64 = row.get(0)?;
+        let piece = row.get_ref(1)?.as_blob()?;
+        let remaining = expected_len - payload.len();
+        if stored_id != chunk_id || piece.len() != remaining.min(CHUNK_SIZE) || piece.is_empty() {
+            return Err(error("TurboVec chunks changed while reading their payload"));
+        }
+        payload.extend_from_slice(piece);
+        chunk_id += 1;
     }
     if payload.len() != expected_len {
         return Err(error(format!(
@@ -490,6 +532,115 @@ pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Resu
     .to_string())
 }
 
+/// Shadow-table inserts must not replace the application's last inserted ID,
+/// including when serialization fails after writing some chunks.
+struct PreserveLastInsertRowid<'a> {
+    connection: &'a Connection,
+    rowid: i64,
+}
+
+impl Drop for PreserveLastInsertRowid<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the borrowed connection outlives this guard.
+        unsafe { ffi::sqlite3_set_last_insert_rowid(self.connection.handle(), self.rowid) };
+    }
+}
+
+/// One new chunk and one old chunk, independent of total serialized size.
+struct ChunkWriter<'a> {
+    connection: &'a Connection,
+    database: &'a str,
+    chunks_table: &'a str,
+    select: Statement<'a>,
+    upsert: Statement<'a>,
+    buffer: Vec<u8>,
+    chunk_id: i64,
+    byte_len: i64,
+    // Preserve SQLite error codes across the std::io::Write interface.
+    failure: Option<Error>,
+}
+
+impl ChunkWriter<'_> {
+    fn write_chunk(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let old: Option<Vec<u8>> = self
+            .select
+            .query_row([self.chunk_id], |row| row.get(0))
+            .optional()?;
+        let piece = self.buffer.as_slice();
+        if let Some(old) = old {
+            if old == piece {
+                return Ok(());
+            }
+            if old.len() == piece.len() {
+                let start = old
+                    .iter()
+                    .zip(piece)
+                    .position(|(before, after)| before != after)
+                    .expect("different equal-length chunks have a first difference");
+                let end = old
+                    .iter()
+                    .zip(piece)
+                    .rposition(|(before, after)| before != after)
+                    .expect("different equal-length chunks have a last difference")
+                    + 1;
+                let mut blob = self.connection.blob_open(
+                    self.database,
+                    self.chunks_table,
+                    "data",
+                    self.chunk_id,
+                    false,
+                )?;
+                blob.write_at(&piece[start..end], start)?;
+                blob.close()?;
+                return Ok(());
+            }
+        }
+        self.upsert.execute(params![self.chunk_id, piece])?;
+        Ok(())
+    }
+
+    fn io_failure(&mut self, cause: Error) -> io::Error {
+        self.failure = Some(cause);
+        io::Error::other("cannot persist TurboVec chunk")
+    }
+}
+
+impl Write for ChunkWriter<'_> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let length = bytes.len();
+        let new_len = i64::try_from(length)
+            .ok()
+            .and_then(|length| self.byte_len.checked_add(length))
+            .ok_or_else(|| {
+                self.io_failure(sqlite_error(
+                    ffi::SQLITE_TOOBIG,
+                    "TurboVec index is too large",
+                ))
+            })?;
+        while !bytes.is_empty() {
+            let take = bytes.len().min(CHUNK_SIZE - self.buffer.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if self.buffer.len() == CHUNK_SIZE {
+                self.write_chunk().map_err(|cause| self.io_failure(cause))?;
+                self.buffer.clear();
+                self.chunk_id += 1;
+            }
+        }
+        self.byte_len = new_len;
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // A flush may occur mid-chunk. Retain it so later writes extend and
+        // replace the same chunk, rather than creating a short interior chunk.
+        self.write_chunk().map_err(|cause| self.io_failure(cause))
+    }
+}
+
 fn write_index(
     connection: &Connection,
     database: &str,
@@ -499,53 +650,48 @@ fn write_index(
     generation: i64,
     index: &IdMapIndex,
 ) -> Result<()> {
-    let payload = index.to_bytes();
-    let existing: Vec<Vec<u8>> = {
-        let mut statement =
-            connection.prepare(&format!("SELECT data FROM {chunks} ORDER BY chunk_id"))?;
-        statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_>>()?
+    let _rowid = PreserveLastInsertRowid {
+        connection,
+        rowid: connection.last_insert_rowid(),
     };
-
-    let pieces: Vec<&[u8]> = payload.chunks(CHUNK_SIZE).collect();
-    let upsert = format!(
-        "INSERT INTO {chunks}(chunk_id, data) VALUES (?1, ?2) \
-         ON CONFLICT(chunk_id) DO UPDATE SET data=excluded.data"
-    );
-    for (chunk_id, piece) in pieces.iter().enumerate() {
-        if let Some(old) = existing.get(chunk_id) {
-            if old == piece {
-                continue;
-            }
-            if old.len() == piece.len() {
-                let start = old
-                    .iter()
-                    .zip(*piece)
-                    .position(|(before, after)| before != after)
-                    .expect("different equal-length chunks have a first difference");
-                let end = old
-                    .iter()
-                    .zip(*piece)
-                    .rposition(|(before, after)| before != after)
-                    .expect("different equal-length chunks have a last difference")
-                    + 1;
-                let mut blob =
-                    connection.blob_open(database, chunks_table, "data", chunk_id as i64, false)?;
-                blob.write_at(&piece[start..end], start)?;
-                blob.close()?;
-                continue;
-            }
-        }
-        connection.execute(&upsert, params![chunk_id as i64, piece])?;
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(CHUNK_SIZE).map_err(|_| {
+        sqlite_error(
+            ffi::SQLITE_NOMEM,
+            "cannot allocate TurboVec serialization buffer",
+        )
+    })?;
+    let mut writer = ChunkWriter {
+        connection,
+        database,
+        chunks_table,
+        select: connection.prepare(&format!("SELECT data FROM {chunks} WHERE chunk_id=?1"))?,
+        upsert: connection.prepare(&format!(
+            "INSERT INTO {chunks}(chunk_id, data) VALUES (?1, ?2) \
+             ON CONFLICT(chunk_id) DO UPDATE SET data=excluded.data"
+        ))?,
+        buffer,
+        chunk_id: 0,
+        byte_len: 0,
+        failure: None,
+    };
+    if let Err(cause) = index.write_to_writer(&mut writer) {
+        return Err(writer
+            .failure
+            .take()
+            .unwrap_or_else(|| error(format!("cannot serialize TurboVec index: {cause}"))));
     }
+    writer.write_chunk()?;
+    let chunk_count = writer.chunk_id + i64::from(!writer.buffer.is_empty());
+    let byte_len = writer.byte_len;
+    drop(writer);
     connection.execute(
         &format!("DELETE FROM {chunks} WHERE chunk_id >= ?1"),
-        [pieces.len() as i64],
+        [chunk_count],
     )?;
     connection.execute(
         &format!("UPDATE {meta} SET generation=?1, byte_len=?2 WHERE id=1"),
-        params![generation, payload.len() as i64],
+        params![generation, byte_len],
     )?;
     Ok(())
 }
@@ -1139,9 +1285,6 @@ impl UpdateVTab<'_> for TurboVecTable {
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
         self.refresh(&mut state)?;
         let exists = state.index.contains(id);
-        if exists && conflict == ConflictMode::Ignore {
-            return Ok(rowid);
-        }
         if exists && conflict != ConflictMode::Replace {
             return Err(sqlite_error(
                 ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
