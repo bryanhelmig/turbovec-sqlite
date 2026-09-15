@@ -1,0 +1,196 @@
+{
+  "date": "2026-09-15",
+  "baseline_commit": "f67f56485c5a784e5c84819b193d532287542994",
+  "candidate_branch": "codex/streaming-commits",
+  "candidate_chunked_rs_sha256": "e2587a6f88f5839ea8dfad0d283b29ee421f0998b0ff0cc7b0d8fb7cfcfe93cb",
+  "environment": {
+    "date": "2026-09-15",
+    "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+    "python": "3.14.7",
+    "sqlite": "3.53.4",
+    "cpu": "Apple M1",
+    "rust": "rustc 1.89.0 (29483883e 2025-08-04)",
+    "node": "v24.19.0",
+    "go": "go version go1.26.6 darwin/arm64"
+  },
+  "memory_metric": "whole-process peak RSS through bulk-build and append commits, bytes; three fresh processes per variant",
+  "memory_workload": "100000 repeated sparse vectors, dimensions 1536, four bits; not a recall benchmark",
+  "memory_samples": {
+    "before": [
+      {
+        "extension": "before",
+        "rows": 100000,
+        "dimensions": 1536,
+        "sqlite": "3.53.4",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+        "rss_before_initial_commit": 114933760,
+        "rss_after_initial_commit": 255295488,
+        "rss_after_append_commit": 327876608,
+        "serialized_bytes": 79666515,
+        "initial_commit_ms": 128.98533325642347,
+        "append_commit_ms": 48.83824987336993
+      },
+      {
+        "extension": "before",
+        "rows": 100000,
+        "dimensions": 1536,
+        "sqlite": "3.53.4",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+        "rss_before_initial_commit": 115097600,
+        "rss_after_initial_commit": 255492096,
+        "rss_after_append_commit": 328056832,
+        "serialized_bytes": 79666515,
+        "initial_commit_ms": 139.00520792230964,
+        "append_commit_ms": 48.67779091000557
+      },
+      {
+        "extension": "before",
+        "rows": 100000,
+        "dimensions": 1536,
+        "sqlite": "3.53.4",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+        "rss_before_initial_commit": 114966528,
+        "rss_after_initial_commit": 255361024,
+        "rss_after_append_commit": 327925760,
+        "serialized_bytes": 79666515,
+        "initial_commit_ms": 135.5471252463758,
+        "append_commit_ms": 46.156832948327065
+      }
+    ],
+    "after": [
+      {
+        "extension": "after",
+        "rows": 100000,
+        "dimensions": 1536,
+        "sqlite": "3.53.4",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+        "rss_before_initial_commit": 115097600,
+        "rss_after_initial_commit": 181682176,
+        "rss_after_append_commit": 182697984,
+        "serialized_bytes": 79666515,
+        "initial_commit_ms": 124.41183300688863,
+        "append_commit_ms": 42.54704201593995
+      },
+      {
+        "extension": "after",
+        "rows": 100000,
+        "dimensions": 1536,
+        "sqlite": "3.53.4",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+        "rss_before_initial_commit": 114835456,
+        "rss_after_initial_commit": 181452800,
+        "rss_after_append_commit": 182468608,
+        "serialized_bytes": 79666515,
+        "initial_commit_ms": 122.38820921629667,
+        "append_commit_ms": 42.542333249002695
+      },
+      {
+        "extension": "after",
+        "rows": 100000,
+        "dimensions": 1536,
+        "sqlite": "3.53.4",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+        "rss_before_initial_commit": 114868224,
+        "rss_after_initial_commit": 179912704,
+        "rss_after_append_commit": 180928512,
+        "serialized_bytes": 79666515,
+        "initial_commit_ms": 128.21462517604232,
+        "append_commit_ms": 43.71120920404792
+      }
+    ]
+  },
+  "write_benchmarks": {
+    "50k": {
+      "before": {
+        "rows": 50000,
+        "dimensions": 384,
+        "batch": 100,
+        "mutations_per_transaction": 200,
+        "repetitions": 5,
+        "build_ms": 271.559958,
+        "database_mib": 10.17578125,
+        "score_mutations_per_second": 15664.058574807195,
+        "median": {
+          "mutation_ms": 4.353291,
+          "commit_ms": 8.358875,
+          "total_ms": 12.768083,
+          "single_ms": 7.911833,
+          "rollback_ms": 0.054209,
+          "reopen_ms": 6.275334,
+          "wal_bytes": 32992
+        },
+        "sqlite_version": "3.53.4",
+        "python_version": "3.14.7",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O"
+      },
+      "after": {
+        "rows": 50000,
+        "dimensions": 384,
+        "batch": 100,
+        "mutations_per_transaction": 200,
+        "repetitions": 5,
+        "build_ms": 272.758417,
+        "database_mib": 10.17578125,
+        "score_mutations_per_second": 15477.48026621266,
+        "median": {
+          "mutation_ms": 4.252458,
+          "commit_ms": 8.661125,
+          "total_ms": 12.922,
+          "single_ms": 7.969667,
+          "rollback_ms": 0.052333,
+          "reopen_ms": 5.672375,
+          "wal_bytes": 32992
+        },
+        "sqlite_version": "3.53.4",
+        "python_version": "3.14.7",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O"
+      }
+    },
+    "100k": {
+      "before": {
+        "rows": 100000,
+        "dimensions": 768,
+        "batch": 100,
+        "mutations_per_transaction": 200,
+        "repetitions": 5,
+        "build_ms": 838.444791,
+        "database_mib": 38.63671875,
+        "score_mutations_per_second": 5234.117632711183,
+        "median": {
+          "mutation_ms": 14.494208,
+          "commit_ms": 23.706041,
+          "total_ms": 38.210834,
+          "single_ms": 22.832916,
+          "rollback_ms": 0.057458,
+          "reopen_ms": 18.77375,
+          "wal_bytes": 57712
+        },
+        "sqlite_version": "3.53.4",
+        "python_version": "3.14.7",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O"
+      },
+      "after": {
+        "rows": 100000,
+        "dimensions": 768,
+        "batch": 100,
+        "mutations_per_transaction": 200,
+        "repetitions": 5,
+        "build_ms": 845.611583,
+        "database_mib": 38.63671875,
+        "score_mutations_per_second": 5578.203993469709,
+        "median": {
+          "mutation_ms": 12.302375,
+          "commit_ms": 23.692167,
+          "total_ms": 35.853834,
+          "single_ms": 23.440667,
+          "rollback_ms": 0.056333,
+          "reopen_ms": 18.0995,
+          "wal_bytes": 57712
+        },
+        "sqlite_version": "3.53.4",
+        "python_version": "3.14.7",
+        "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O"
+      }
+    }
+  }
+}

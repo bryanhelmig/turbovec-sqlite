@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.1.4
+version=0.1.5
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.1.4-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.1.5-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -76,6 +76,31 @@ insert or replace into document_vectors(rowid, embedding)
 values (:id, :embedding);
 ```
 
+Skip an existing row and check whether an insertion happened:
+
+```sql
+insert or ignore into document_vectors(rowid, embedding)
+values (:id, :embedding);
+select changes();
+```
+
+Read `changes()` immediately after the insert, before an explicit `COMMIT`:
+commit-time shadow writes can replace that count. `last_insert_rowid()` is
+preserved across commit.
+
+Some SQLite hosts emit `RETURNING` rows even for ignored virtual-table inserts.
+If returned rows must identify only successful inserts, filter duplicates before
+the insert instead:
+
+```sql
+insert into document_vectors(rowid, embedding)
+select :id, :embedding
+where not exists (
+  select 1 from document_vectors where rowid = :id
+)
+returning rowid;
+```
+
 Delete a vector:
 
 ```sql
@@ -107,7 +132,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.1.4
+-- 0.1.5
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
@@ -123,16 +148,16 @@ See [`examples/demo.sql`](examples/demo.sql) for a complete CLI example.
 
 ## What things cost
 
-The current warm index is per connection. Measurements from a 370,000-vector,
-1,536-dimensional, 4-bit integration produced this operating model at roughly
-280 MB serialized:
+The warm index is per connection. Measurements with version 0.1.4 on a
+370,000-vector, 1,536-dimensional, 4-bit integration produced this operating
+model at roughly 280 MB serialized:
 
 | Operation | Current cost | Observed time |
 |---|---|---:|
 | First query on a connection | O(index) load | about 0.3 s |
 | Commit after a vector write | O(index) serialization | about 0.25 s |
-| First delete or replacement in a transaction | one lazy O(index) checkpoint | about 85 ms |
-| Insert and savepoint bookkeeping | O(changes), since 0.1.2 | near-zero fixed cost |
+| First delete/replace per transaction | lazy O(index) copy | about 85 ms |
+| Insert and savepoint bookkeeping | O(changes), since 0.1.2 | near-zero |
 
 These values describe one integration, not a hardware promise. The consequences
 are simple:
@@ -152,6 +177,11 @@ commit;
 
 Put inserts before deletes or replacements in a large mixed transaction. The
 first destructive write creates the lazy rollback checkpoint.
+
+Since 0.1.5, commits stream serialization through a 4 MiB buffer and
+compare one stored chunk at a time. This avoids holding complete old and new
+serialized images during commit, while still doing O(index) work. Initial loads
+and the destructive rollback checkpoint still require full-index memory.
 
 ## Keep content and vectors in sync
 
@@ -259,8 +289,9 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and disk format are separate. Version 0.1.4 writes TurboVec
-format v7, revision 2. During 0.x, a release may intentionally break disk
+The crate version and disk format are separate. Version 0.1.5 writes TurboVec
+format v7, revision 2, unchanged from 0.1.4; no index rebuild is needed for this
+upgrade. During 0.x, a release may intentionally break disk
 compatibility and will say so in the changelog. The extension checks the header
 before deserialization and refuses another format or revision with a specific
 error. Keep a recoverable copy of source embeddings.
