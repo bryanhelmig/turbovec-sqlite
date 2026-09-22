@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_int};
 use std::io::{self, Write};
 use std::marker::PhantomData;
+use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
@@ -23,6 +24,11 @@ use crate::{TURBOVEC_FORMAT_REVISION, TURBOVEC_FORMAT_VERSION, check_format, par
 
 const MODULE_NAME: &CStr = c"turbovec0";
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+const DELTA_MAGIC: &[u8; 4] = b"TVD1";
+const DELTA_HEADER_LEN: usize = 12;
+const DELTA_CHECKSUM_LEN: usize = 4;
+const MIN_DELTA_BASE_BYTES: usize = 1024 * 1024;
+const MIN_COMPACTION_DELTA_BYTES: usize = 16 * 1024 * 1024;
 
 const COL_EMBEDDING: c_int = 0;
 const COL_SCORE: c_int = 1;
@@ -403,18 +409,28 @@ fn read_generation(connection: &Connection, meta: &str) -> Result<i64> {
     )
 }
 
-fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, Vec<u8>)> {
-    let (generation, expected_len): (i64, i64) = connection.query_row(
+fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, Vec<u8>, bool)> {
+    let (generation, stored_len): (i64, i64) = connection.query_row(
         &format!("SELECT generation, byte_len FROM {meta} WHERE id=1"),
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let has_deltas = stored_len < 0;
+    let expected_len = if has_deltas {
+        stored_len
+            .checked_neg()
+            .and_then(|length| length.checked_sub(1))
+            .ok_or_else(|| error("invalid persisted TurboVec byte length"))?
+    } else {
+        stored_len
+    };
     let expected_len = usize::try_from(expected_len)
         .map_err(|_| error("negative or oversized persisted TurboVec byte length"))?;
     // Check storage geometry before allocating from untrusted metadata. SQLite
     // can read BLOB lengths without loading their contents into Rust buffers.
     let mut statement = connection.prepare(&format!(
-        "SELECT chunk_id, length(data), typeof(data) FROM {chunks} ORDER BY chunk_id"
+        "SELECT chunk_id, length(data), typeof(data) FROM {chunks} \
+         WHERE chunk_id>=0 ORDER BY chunk_id"
     ))?;
     let mut rows = statement.query([])?;
     let mut count = 0_i64;
@@ -450,7 +466,7 @@ fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i6
         .try_reserve_exact(actual_len)
         .map_err(|_| sqlite_error(ffi::SQLITE_NOMEM, "cannot allocate TurboVec chunk payload"))?;
     let mut statement = connection.prepare(&format!(
-        "SELECT chunk_id, data FROM {chunks} ORDER BY chunk_id"
+        "SELECT chunk_id, data FROM {chunks} WHERE chunk_id>=0 ORDER BY chunk_id"
     ))?;
     let mut rows = statement.query([])?;
     let mut chunk_id = 0_i64;
@@ -470,16 +486,202 @@ fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i6
             payload.len()
         )));
     }
-    Ok((generation, payload))
+    Ok((generation, payload, has_deltas))
 }
 
-fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, IdMapIndex)> {
-    let (generation, payload) = read_payload(connection, meta, chunks)?;
+struct LoadedIndex {
+    generation: i64,
+    index: IdMapIndex,
+    base_bytes: usize,
+    delta_bytes: usize,
+    delta_operations: usize,
+}
+
+fn decode_delta(blob: &[u8], dimensions: usize) -> Result<Vec<Change>> {
+    if blob.len() < DELTA_HEADER_LEN + DELTA_CHECKSUM_LEN || &blob[..4] != DELTA_MAGIC {
+        return Err(error("invalid turbovec0 delta header"));
+    }
+    let stored_dimensions = u32::from_le_bytes(blob[4..8].try_into().unwrap()) as usize;
+    if stored_dimensions != dimensions {
+        return Err(error("turbovec0 delta dimension disagrees with its table"));
+    }
+    let operations = u32::from_le_bytes(blob[8..12].try_into().unwrap()) as usize;
+    let checksum_at = blob.len() - DELTA_CHECKSUM_LEN;
+    if operations > checksum_at.saturating_sub(DELTA_HEADER_LEN) / 9 {
+        return Err(error("invalid turbovec0 delta operation count"));
+    }
+    let stored_checksum = u32::from_le_bytes(blob[checksum_at..].try_into().unwrap());
+    if crc32fast::hash(&blob[..checksum_at]) != stored_checksum {
+        return Err(error("turbovec0 delta checksum mismatch"));
+    }
+    let vector_bytes = dimensions
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| error("oversized turbovec0 delta vector"))?;
+    let mut at = DELTA_HEADER_LEN;
+    let mut changes = Vec::new();
+    changes
+        .try_reserve_exact(operations)
+        .map_err(|_| sqlite_error(ffi::SQLITE_NOMEM, "cannot allocate turbovec0 delta"))?;
+    for _ in 0..operations {
+        if checksum_at.saturating_sub(at) < 9 {
+            return Err(error("truncated turbovec0 delta operation"));
+        }
+        let operation = blob[at];
+        let id = u64::from_le_bytes(blob[at + 1..at + 9].try_into().unwrap());
+        at += 9;
+        match operation {
+            1 => {
+                if checksum_at.saturating_sub(at) < vector_bytes {
+                    return Err(error("truncated turbovec0 delta vector"));
+                }
+                let mut vector = Vec::new();
+                vector.try_reserve_exact(dimensions).map_err(|_| {
+                    sqlite_error(ffi::SQLITE_NOMEM, "cannot allocate turbovec0 delta vector")
+                })?;
+                vector.extend(
+                    blob[at..at + vector_bytes]
+                        .chunks_exact(size_of::<f32>())
+                        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())),
+                );
+                at += vector_bytes;
+                changes.push(Change::Insert {
+                    id,
+                    vector: Some(vector),
+                    replaces: true,
+                });
+            }
+            2 => changes.push(Change::Delete { id }),
+            _ => return Err(error("unknown turbovec0 delta operation")),
+        }
+    }
+    if at != checksum_at {
+        return Err(error("trailing bytes in turbovec0 delta"));
+    }
+    Ok(changes)
+}
+
+fn encode_delta(changes: &[Change], dimensions: usize) -> Result<Vec<u8>> {
+    let operations = u32::try_from(changes.len())
+        .map_err(|_| sqlite_error(ffi::SQLITE_TOOBIG, "too many turbovec0 delta operations"))?;
+    let capacity = delta_encoded_len(changes, dimensions)?;
+    let mut blob = Vec::new();
+    blob.try_reserve_exact(capacity)
+        .map_err(|_| sqlite_error(ffi::SQLITE_NOMEM, "cannot allocate turbovec0 delta"))?;
+    blob.extend_from_slice(DELTA_MAGIC);
+    blob.extend_from_slice(
+        &u32::try_from(dimensions)
+            .map_err(|_| error("turbovec0 dimensions exceed the delta format"))?
+            .to_le_bytes(),
+    );
+    blob.extend_from_slice(&operations.to_le_bytes());
+    for change in changes {
+        match change {
+            Change::Insert { id, vector, .. } => {
+                let vector = vector
+                    .as_ref()
+                    .ok_or_else(|| error("turbovec0 delta is missing an inserted vector"))?;
+                if vector.len() != dimensions {
+                    return Err(error("turbovec0 delta contains a wrong-sized vector"));
+                }
+                blob.push(1);
+                blob.extend_from_slice(&id.to_le_bytes());
+                for value in vector {
+                    blob.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            Change::Delete { id } => {
+                blob.push(2);
+                blob.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+    }
+    debug_assert_eq!(blob.len() + DELTA_CHECKSUM_LEN, capacity);
+    let checksum = crc32fast::hash(&blob);
+    blob.extend_from_slice(&checksum.to_le_bytes());
+    Ok(blob)
+}
+
+fn delta_encoded_len(changes: &[Change], dimensions: usize) -> Result<usize> {
+    let vector_bytes = dimensions
+        .checked_mul(size_of::<f32>())
+        .ok_or_else(|| error("oversized turbovec0 delta vector"))?;
+    let inserts = changes
+        .iter()
+        .filter(|change| matches!(change, Change::Insert { .. }))
+        .count();
+    DELTA_HEADER_LEN
+        .checked_add(
+            changes
+                .len()
+                .checked_mul(9)
+                .ok_or_else(|| sqlite_error(ffi::SQLITE_TOOBIG, "turbovec0 delta is too large"))?,
+        )
+        .and_then(|length| length.checked_add(inserts.checked_mul(vector_bytes)?))
+        .and_then(|length| length.checked_add(DELTA_CHECKSUM_LEN))
+        .ok_or_else(|| sqlite_error(ffi::SQLITE_TOOBIG, "turbovec0 delta is too large"))
+}
+
+fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<LoadedIndex> {
+    let (generation, payload, expects_deltas) = read_payload(connection, meta, chunks)?;
     check_format(&payload)
         .map_err(|cause| error(format!("cannot open turbovec0 index: {cause}")))?;
-    let index = IdMapIndex::from_bytes(&payload)
+    let mut index = IdMapIndex::from_bytes(&payload)
         .map_err(|cause| error(format!("invalid chunked TurboVec index: {cause}")))?;
-    Ok((generation, index))
+    let dimensions = index
+        .dim_opt()
+        .ok_or_else(|| error("persisted turbovec0 index has no dimensions"))?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT chunk_id, data, typeof(data) FROM {chunks} \
+         WHERE chunk_id<0 ORDER BY chunk_id DESC"
+    ))?;
+    let mut rows = statement.query([])?;
+    let mut previous_generation = None;
+    let mut delta_bytes = 0_usize;
+    let mut delta_operations = 0_usize;
+    while let Some(row) = rows.next()? {
+        let chunk_id: i64 = row.get(0)?;
+        let kind: String = row.get(2)?;
+        let delta_generation = chunk_id
+            .checked_neg()
+            .ok_or_else(|| error("invalid turbovec0 delta generation"))?;
+        if let Some(previous) = previous_generation
+            && delta_generation != previous + 1
+        {
+            return Err(error("non-contiguous turbovec0 delta generations"));
+        }
+        let blob = row.get_ref(1)?.as_blob()?;
+        if kind != "blob" {
+            return Err(error("invalid turbovec0 delta storage type"));
+        }
+        let changes = decode_delta(blob, dimensions)?;
+        TurboVecTable::replay(&mut index, &changes)?;
+        delta_bytes = delta_bytes
+            .checked_add(blob.len())
+            .ok_or_else(|| error("oversized turbovec0 delta storage"))?;
+        delta_operations = delta_operations
+            .checked_add(changes.len())
+            .ok_or_else(|| error("too many turbovec0 delta operations"))?;
+        previous_generation = Some(delta_generation);
+    }
+    match previous_generation {
+        Some(_) if !expects_deltas => {
+            return Err(error("unexpected turbovec0 delta storage"));
+        }
+        Some(latest_delta) if latest_delta != generation => {
+            return Err(error(
+                "latest turbovec0 delta generation disagrees with metadata",
+            ));
+        }
+        None if expects_deltas => return Err(error("missing turbovec0 delta storage")),
+        _ => {}
+    }
+    Ok(LoadedIndex {
+        generation,
+        index,
+        base_bytes: payload.len(),
+        delta_bytes,
+        delta_operations,
+    })
 }
 
 pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Result<String> {
@@ -514,18 +716,17 @@ pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Resu
     }
 
     let (meta, chunks) = names_str(database, table);
-    let (generation, payload) = read_payload(connection, &meta, &chunks)?;
-    check_format(&payload)
-        .map_err(|cause| error(format!("cannot inspect turbovec0 index: {cause}")))?;
-    let index = IdMapIndex::from_bytes(&payload)
-        .map_err(|cause| error(format!("invalid chunked TurboVec index: {cause}")))?;
+    let loaded = read_index(connection, &meta, &chunks)?;
     Ok(serde_json::json!({
         "table": qualified_table,
-        "generation": generation,
-        "count": index.len(),
-        "bit_width": index.bit_width(),
-        "dimensions": index.dim_opt(),
-        "serialized_bytes": payload.len(),
+        "generation": loaded.generation,
+        "count": loaded.index.len(),
+        "bit_width": loaded.index.bit_width(),
+        "dimensions": loaded.index.dim_opt(),
+        "serialized_bytes": loaded.base_bytes + loaded.delta_bytes,
+        "base_bytes": loaded.base_bytes,
+        "delta_bytes": loaded.delta_bytes,
+        "delta_operations": loaded.delta_operations,
         "format_version": TURBOVEC_FORMAT_VERSION,
         "format_revision": TURBOVEC_FORMAT_REVISION,
     })
@@ -649,7 +850,7 @@ fn write_index(
     chunks_table: &str,
     generation: i64,
     index: &IdMapIndex,
-) -> Result<()> {
+) -> Result<usize> {
     let _rowid = PreserveLastInsertRowid {
         connection,
         rowid: connection.last_insert_rowid(),
@@ -686,12 +887,41 @@ fn write_index(
     let byte_len = writer.byte_len;
     drop(writer);
     connection.execute(
-        &format!("DELETE FROM {chunks} WHERE chunk_id >= ?1"),
+        &format!("DELETE FROM {chunks} WHERE chunk_id < 0 OR chunk_id >= ?1"),
         [chunk_count],
     )?;
     connection.execute(
         &format!("UPDATE {meta} SET generation=?1, byte_len=?2 WHERE id=1"),
         params![generation, byte_len],
+    )?;
+    usize::try_from(byte_len).map_err(|_| error("invalid serialized turbovec0 byte length"))
+}
+
+fn write_delta(
+    connection: &Connection,
+    meta: &str,
+    chunks: &str,
+    generation: i64,
+    blob: &[u8],
+) -> Result<()> {
+    let _rowid = PreserveLastInsertRowid {
+        connection,
+        rowid: connection.last_insert_rowid(),
+    };
+    let chunk_id = generation
+        .checked_neg()
+        .filter(|chunk_id| *chunk_id < 0)
+        .ok_or_else(|| error("invalid turbovec0 delta generation"))?;
+    connection.execute(
+        &format!("INSERT INTO {chunks}(chunk_id,data) VALUES(?1,?2)"),
+        params![chunk_id, blob],
+    )?;
+    connection.execute(
+        &format!(
+            "UPDATE {meta} SET generation=?1, \
+             byte_len=CASE WHEN byte_len>=0 THEN -byte_len-1 ELSE byte_len END WHERE id=1"
+        ),
+        [generation],
     )?;
     Ok(())
 }
@@ -715,11 +945,21 @@ struct State {
     index: IdMapIndex,
     transaction: Option<TransactionState>,
     dirty: bool,
+    base_bytes: usize,
+    delta_bytes: usize,
+    delta_operations: usize,
+    needs_reload: bool,
 }
 
 enum Change {
-    Insert { id: u64, vector: Option<Vec<f32>> },
-    Delete { id: u64 },
+    Insert {
+        id: u64,
+        vector: Option<Vec<f32>>,
+        replaces: bool,
+    },
+    Delete {
+        id: u64,
+    },
 }
 
 struct DestructiveCheckpoint {
@@ -729,18 +969,31 @@ struct DestructiveCheckpoint {
 
 struct TransactionState {
     start_generation: i64,
+    start_base_bytes: usize,
+    start_delta_bytes: usize,
+    start_delta_operations: usize,
     changes: Vec<Change>,
     destructive_checkpoint: Option<DestructiveCheckpoint>,
     savepoints: Vec<(c_int, usize)>,
+    synced_changes: usize,
 }
 
 impl TransactionState {
-    fn new(start_generation: i64) -> Self {
+    fn new(
+        start_generation: i64,
+        start_base_bytes: usize,
+        start_delta_bytes: usize,
+        start_delta_operations: usize,
+    ) -> Self {
         Self {
             start_generation,
+            start_base_bytes,
+            start_delta_bytes,
+            start_delta_operations,
             changes: Vec::new(),
             destructive_checkpoint: None,
             savepoints: Vec::new(),
+            synced_changes: 0,
         }
     }
 }
@@ -790,7 +1043,7 @@ impl TurboVecTable {
         let handle = unsafe { db.handle() };
         let connection = connection(handle)?;
 
-        let (generation, index) = if create {
+        let loaded = if create {
             let index = IdMapIndex::new(dimensions, bit_width)
                 .map_err(|cause| error(format!("invalid turbovec0 geometry: {cause}")))?;
             connection.execute_batch(&format!(
@@ -813,7 +1066,7 @@ impl TurboVecTable {
                 ),
                 params![dimensions as i64, bit_width as i64],
             )?;
-            write_index(
+            let base_bytes = write_index(
                 &connection,
                 &database,
                 &meta,
@@ -822,7 +1075,13 @@ impl TurboVecTable {
                 0,
                 &index,
             )?;
-            (0, index)
+            LoadedIndex {
+                generation: 0,
+                index,
+                base_bytes,
+                delta_bytes: 0,
+                delta_operations: 0,
+            }
         } else {
             let stored: (i64, i64) = connection.query_row(
                 &format!("SELECT dimensions, bit_width FROM {meta} WHERE id=1"),
@@ -837,7 +1096,7 @@ impl TurboVecTable {
                 )));
             }
             let loaded = read_index(&connection, &meta, &chunks)?;
-            validate_geometry(&loaded.1, dimensions, bit_width)?;
+            validate_geometry(&loaded.index, dimensions, bit_width)?;
             loaded
         };
 
@@ -850,10 +1109,14 @@ impl TurboVecTable {
             chunks,
             chunks_table,
             state: Mutex::new(State {
-                generation,
-                index,
+                generation: loaded.generation,
+                index: loaded.index,
                 transaction: None,
                 dirty: false,
+                base_bytes: loaded.base_bytes,
+                delta_bytes: loaded.delta_bytes,
+                delta_operations: loaded.delta_operations,
+                needs_reload: false,
             }),
         })
     }
@@ -864,10 +1127,14 @@ impl TurboVecTable {
         }
         let connection = connection(self.db)?;
         let persisted_generation = read_generation(&connection, &self.meta)?;
-        if persisted_generation != state.generation {
-            let (generation, index) = read_index(&connection, &self.meta, &self.chunks)?;
-            state.generation = generation;
-            state.index = index;
+        if state.needs_reload || persisted_generation != state.generation {
+            let loaded = read_index(&connection, &self.meta, &self.chunks)?;
+            state.generation = loaded.generation;
+            state.index = loaded.index;
+            state.base_bytes = loaded.base_bytes;
+            state.delta_bytes = loaded.delta_bytes;
+            state.delta_operations = loaded.delta_operations;
+            state.needs_reload = false;
         }
         Ok(state)
     }
@@ -890,7 +1157,7 @@ impl TurboVecTable {
 
     fn integrity(&self) -> Result<()> {
         let connection = connection(self.db)?;
-        let (_, index) = read_index(&connection, &self.meta, &self.chunks)?;
+        let loaded = read_index(&connection, &self.meta, &self.chunks)?;
         let (dimensions, bit_width): (i64, i64) = connection.query_row(
             &format!("SELECT dimensions, bit_width FROM {} WHERE id=1", self.meta),
             [],
@@ -900,20 +1167,37 @@ impl TurboVecTable {
             .map_err(|_| error("invalid dimension in turbovec0 metadata"))?;
         let bit_width = usize::try_from(bit_width)
             .map_err(|_| error("invalid bit width in turbovec0 metadata"))?;
-        validate_geometry(&index, dimensions, bit_width)
+        validate_geometry(&loaded.index, dimensions, bit_width)
     }
 
     fn ensure_transaction(state: &mut State) -> &mut TransactionState {
-        state
-            .transaction
-            .get_or_insert_with(|| TransactionState::new(state.generation))
+        let start_generation = state.generation;
+        let start_base_bytes = state.base_bytes;
+        let start_delta_bytes = state.delta_bytes;
+        let start_delta_operations = state.delta_operations;
+        state.transaction.get_or_insert_with(|| {
+            TransactionState::new(
+                start_generation,
+                start_base_bytes,
+                start_delta_bytes,
+                start_delta_operations,
+            )
+        })
     }
 
     fn ensure_destructive_checkpoint(state: &mut State) {
-        let needs_checkpoint = state
-            .transaction
-            .as_ref()
-            .is_none_or(|transaction| transaction.destructive_checkpoint.is_none());
+        Self::ensure_transaction(state);
+        // Ordinary deletes need no eager image. A rollback can rebuild from
+        // committed storage and replay the retained operation prefix. The
+        // only fallback is a transaction that bulk-inserted without retaining
+        // vectors before its first destructive change.
+        let needs_checkpoint = state.transaction.as_ref().is_some_and(|transaction| {
+            transaction.destructive_checkpoint.is_none()
+                && transaction
+                    .changes
+                    .iter()
+                    .any(|change| matches!(change, Change::Insert { vector: None, .. }))
+        });
         if !needs_checkpoint {
             return;
         }
@@ -928,7 +1212,7 @@ impl TurboVecTable {
     fn replay(index: &mut IdMapIndex, changes: &[Change]) -> Result<()> {
         for change in changes {
             match change {
-                Change::Insert { id, vector } => {
+                Change::Insert { id, vector, .. } => {
                     let vector = vector.as_ref().ok_or_else(|| {
                         error("turbovec0 transaction replay is missing an inserted vector")
                     })?;
@@ -953,7 +1237,7 @@ impl TurboVecTable {
 
     fn undo_insert_prefix(index: &mut IdMapIndex, changes: &[Change]) -> Result<()> {
         for change in changes.iter().rev() {
-            let Change::Insert { id, vector: None } = change else {
+            let Change::Insert { id, .. } = change else {
                 return Err(error(
                     "turbovec0 transaction prefix contains a destructive change",
                 ));
@@ -967,7 +1251,7 @@ impl TurboVecTable {
         Ok(())
     }
 
-    fn restore_to(state: &mut State, change_index: usize) -> Result<()> {
+    fn restore_to(&self, state: &mut State, change_index: usize) -> Result<()> {
         let mut transaction = state
             .transaction
             .take()
@@ -993,9 +1277,34 @@ impl TurboVecTable {
                 transaction.destructive_checkpoint = Some(checkpoint);
             }
         } else {
-            Self::undo_insert_prefix(&mut state.index, &transaction.changes[change_index..])?;
+            let tail_is_append_only = transaction.changes[change_index..].iter().all(|change| {
+                matches!(
+                    change,
+                    Change::Insert {
+                        replaces: false,
+                        ..
+                    }
+                )
+            });
+            if tail_is_append_only {
+                Self::undo_insert_prefix(&mut state.index, &transaction.changes[change_index..])?;
+            } else {
+                if transaction.synced_changes != 0 {
+                    state.transaction = Some(transaction);
+                    return Err(error("cannot roll back a turbovec0 savepoint after xSync"));
+                }
+                let connection = connection(self.db)?;
+                let loaded = read_index(&connection, &self.meta, &self.chunks)?;
+                if loaded.generation != transaction.start_generation {
+                    state.transaction = Some(transaction);
+                    return Err(error("turbovec0 changed while restoring a savepoint"));
+                }
+                state.index = loaded.index;
+                Self::replay(&mut state.index, &transaction.changes[..change_index])?;
+            }
         }
         transaction.changes.truncate(change_index);
+        transaction.synced_changes = transaction.synced_changes.min(change_index);
         state.dirty = !transaction.changes.is_empty();
         state.transaction = Some(transaction);
         Ok(())
@@ -1044,7 +1353,7 @@ impl TurboVecTable {
             .find(|(existing, _)| *existing == id)
             .map(|(_, change_index)| *change_index)
             .ok_or_else(|| error(format!("unknown turbovec0 savepoint {id}")))?;
-        Self::restore_to(&mut state, change_index)?;
+        self.restore_to(&mut state, change_index)?;
         state
             .transaction
             .as_mut()
@@ -1301,14 +1610,23 @@ impl UpdateVTab<'_> for TurboVecTable {
             .index
             .add_with_ids(&vector, &[id])
             .map_err(|cause| error(format!("cannot insert vector: {cause}")))?;
+        let retain_vector = state.base_bytes >= MIN_DELTA_BASE_BYTES
+            || exists
+            || state.transaction.as_ref().is_some_and(|transaction| {
+                transaction.destructive_checkpoint.is_some()
+                    || transaction
+                        .changes
+                        .iter()
+                        .any(|change| matches!(change, Change::Delete { .. }))
+            });
         let transaction = state
             .transaction
             .as_mut()
             .expect("insert creates a transaction");
-        let replay_vector = transaction.destructive_checkpoint.as_ref().map(|_| vector);
         transaction.changes.push(Change::Insert {
             id,
-            vector: replay_vector,
+            vector: retain_vector.then_some(vector),
+            replaces: exists,
         });
         state.dirty = true;
         Ok(rowid)
@@ -1373,7 +1691,12 @@ impl TransactionVTab<'_> for TurboVecTable {
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
         self.refresh(&mut state)?;
         if state.transaction.is_none() {
-            state.transaction = Some(TransactionState::new(state.generation));
+            state.transaction = Some(TransactionState::new(
+                state.generation,
+                state.base_bytes,
+                state.delta_bytes,
+                state.delta_operations,
+            ));
         }
         Ok(())
     }
@@ -1390,16 +1713,57 @@ impl TransactionVTab<'_> for TurboVecTable {
             .generation
             .checked_add(1)
             .ok_or_else(|| error("turbovec0 generation overflow"))?;
+        let (synced_changes, change_count) = state
+            .transaction
+            .as_ref()
+            .map(|transaction| (transaction.synced_changes, transaction.changes.len()))
+            .ok_or_else(|| error("dirty turbovec0 state has no transaction"))?;
+        if synced_changes >= change_count {
+            return Err(error("dirty turbovec0 state has no unsynced changes"));
+        }
+        let pending = &state
+            .transaction
+            .as_ref()
+            .expect("transaction checked above")
+            .changes[synced_changes..];
+        let delta_len = delta_encoded_len(pending, self.dimensions)?;
+        let next_delta_bytes = state
+            .delta_bytes
+            .checked_add(delta_len)
+            .ok_or_else(|| sqlite_error(ffi::SQLITE_TOOBIG, "turbovec0 delta is too large"))?;
+        let next_delta_operations = state
+            .delta_operations
+            .checked_add(pending.len())
+            .ok_or_else(|| error("too many turbovec0 delta operations"))?;
+        let byte_limit = (state.base_bytes / 4).max(MIN_COMPACTION_DELTA_BYTES);
+        let operation_limit = (state.index.len() / 4).max(10_000);
+        let compact = state.base_bytes < MIN_DELTA_BASE_BYTES
+            || next_delta_bytes >= byte_limit
+            || next_delta_operations >= operation_limit;
         let connection = connection(self.db)?;
-        write_index(
-            &connection,
-            &self.database,
-            &self.meta,
-            &self.chunks,
-            &self.chunks_table,
-            generation,
-            &state.index,
-        )?;
+        if compact {
+            state.base_bytes = write_index(
+                &connection,
+                &self.database,
+                &self.meta,
+                &self.chunks,
+                &self.chunks_table,
+                generation,
+                &state.index,
+            )?;
+            state.delta_bytes = 0;
+            state.delta_operations = 0;
+        } else {
+            let blob = encode_delta(pending, self.dimensions)?;
+            write_delta(&connection, &self.meta, &self.chunks, generation, &blob)?;
+            state.delta_bytes = next_delta_bytes;
+            state.delta_operations = next_delta_operations;
+        }
+        state
+            .transaction
+            .as_mut()
+            .expect("transaction checked above")
+            .synced_changes = change_count;
         state.generation = generation;
         state.dirty = false;
         Ok(())
@@ -1428,9 +1792,18 @@ impl TransactionVTab<'_> for TurboVecTable {
             return Ok(());
         };
         let start_generation = transaction.start_generation;
-        Self::restore_to(&mut state, 0)?;
+        let start_base_bytes = transaction.start_base_bytes;
+        let start_delta_bytes = transaction.start_delta_bytes;
+        let start_delta_operations = transaction.start_delta_operations;
         state.transaction = None;
         state.generation = start_generation;
+        state.base_bytes = start_base_bytes;
+        state.delta_bytes = start_delta_bytes;
+        state.delta_operations = start_delta_operations;
+        // SQLite rolls shadow-table writes back around xRollback. Reload on
+        // the next use, after that rollback is complete, instead of copying
+        // the full index before every potentially destructive transaction.
+        state.needs_reload = true;
         state.dirty = false;
         Ok(())
     }

@@ -28,6 +28,7 @@ class Result:
     mutations: int
     mutation_ms: float
     commit_ms: float
+    reopen_ms: float
     wal_bytes: int
     row_count: int
     search_digest: str
@@ -41,7 +42,13 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--rows", type=int, default=700_000)
     parser.add_argument("--dimensions", type=int, default=1536)
     parser.add_argument("--churn-rounds", type=int, default=20)
+    parser.add_argument(
+        "--case",
+        action="append",
+        help="run one named case (repeatable); use 'churn' for the churn case",
+    )
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--keep-databases", action="store_true")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     for extension in filter(None, (args.extension, args.baseline_extension)):
@@ -80,6 +87,12 @@ def connect(database: Path, extension: Path) -> sqlite3.Connection:
     return connection
 
 
+def remove_database(database: Path) -> None:
+    database.unlink(missing_ok=True)
+    database.with_name(database.name + "-wal").unlink(missing_ok=True)
+    database.with_name(database.name + "-shm").unlink(missing_ok=True)
+
+
 def geometry_matches(database: Path, extension: Path, rows: int, dimensions: int) -> bool:
     if not database.exists():
         return False
@@ -93,9 +106,7 @@ def geometry_matches(database: Path, extension: Path, rows: int, dimensions: int
 
 
 def build_base(database: Path, extension: Path, rows: int, dimensions: int) -> float:
-    database.unlink(missing_ok=True)
-    database.with_name(database.name + "-wal").unlink(missing_ok=True)
-    database.with_name(database.name + "-shm").unlink(missing_ok=True)
+    remove_database(database)
     connection = connect(database, extension)
     if connection.execute("pragma journal_mode=wal").fetchone()[0] != "wal":
         raise AssertionError("WAL mode was not enabled")
@@ -160,14 +171,34 @@ def run_case(
     wal_bytes = wal.stat().st_size if wal.exists() else 0
     row_count = connection.execute("select count(*) from vectors").fetchone()[0]
     search_digest = digest_search(connection, dimensions)
-    if connection.execute("pragma integrity_check").fetchall() != [("ok",)]:
-        raise AssertionError(f"integrity check failed after {name}")
     connection.close()
-    return Result(name, mutations, mutation_ms, commit_ms, wal_bytes, row_count, search_digest)
+    reopened = connect(database, extension)
+    started = time.perf_counter_ns()
+    reopened_count = reopened.execute("select count(*) from vectors").fetchone()[0]
+    reopen_ms = (time.perf_counter_ns() - started) / 1_000_000
+    if reopened_count != row_count:
+        raise AssertionError(f"row count changed after reopening {name}")
+    if digest_search(reopened, dimensions) != search_digest:
+        raise AssertionError(f"search results changed after reopening {name}")
+    if reopened.execute("pragma integrity_check").fetchall() != [("ok",)]:
+        raise AssertionError(f"integrity check failed after {name}")
+    reopened.close()
+    return Result(
+        name,
+        mutations,
+        mutation_ms,
+        commit_ms,
+        reopen_ms,
+        wal_bytes,
+        row_count,
+        search_digest,
+    )
 
 
 def mutations(rows: int, dimensions: int) -> list[tuple[str, Mutation]]:
     delete_ids = scattered(rows, 200)
+    large_delete_ids = scattered(rows, 5_000, offset=43)
+    neighboring_delete_ids = list(range(rows // 2, rows // 2 + 200))
     replace_200 = scattered(rows, 200, offset=17)
     replace_5000 = scattered(rows, 5000, offset=31)
 
@@ -187,9 +218,16 @@ def mutations(rows: int, dimensions: int) -> list[tuple[str, Mutation]]:
 
         return apply
 
-    def delete(connection: sqlite3.Connection) -> int:
-        connection.executemany("delete from vectors where rowid=?", ((rowid,) for rowid in delete_ids))
-        return len(delete_ids)
+    def delete(ids: Iterable[int]) -> Mutation:
+        ids = list(ids)
+
+        def apply(connection: sqlite3.Connection) -> int:
+            connection.executemany(
+                "delete from vectors where rowid=?", ((rowid,) for rowid in ids)
+            )
+            return len(ids)
+
+        return apply
 
     def replace(ids: Iterable[int], revision: int) -> Mutation:
         ids = list(ids)
@@ -207,7 +245,10 @@ def mutations(rows: int, dimensions: int) -> list[tuple[str, Mutation]]:
         ("no_change", no_change),
         ("insert_1", insert(1)),
         ("insert_200", insert(200)),
-        ("delete_200_scattered", delete),
+        ("delete_1", delete([rows // 2])),
+        ("delete_200_scattered", delete(delete_ids)),
+        ("delete_200_neighboring", delete(neighboring_delete_ids)),
+        ("delete_5000_scattered", delete(large_delete_ids)),
         ("replace_200_scattered", replace(replace_200, 1)),
         ("replace_5000_scattered", replace(replace_5000, 2)),
     ]
@@ -255,6 +296,11 @@ def run_churn(
         "search_digest": digest_search(connection, dimensions),
     }
     connection.close()
+    reopened = connect(database, extension)
+    reopened_digest = digest_search(reopened, dimensions)
+    reopened.close()
+    if reopened_digest != result["search_digest"]:
+        raise AssertionError("search results changed after reopening churn database")
     return result
 
 
@@ -283,7 +329,10 @@ def main() -> None:
     for variant, extension in variants:
         print(f"\n{variant}: {extension}", flush=True)
         results = []
+        selected = set(args.case or ())
         for name, mutate in mutations(args.rows, args.dimensions):
+            if selected and name not in selected:
+                continue
             result = run_case(
                 base,
                 args.workdir / f"{variant}-{name}.db",
@@ -295,22 +344,29 @@ def main() -> None:
             results.append(result)
             print(
                 f"{name:24} commit={result.commit_ms:9.2f} ms "
-                f"WAL={result.wal_bytes / 1_048_576:9.2f} MiB",
+                f"WAL={result.wal_bytes / 1_048_576:9.2f} MiB "
+                f"reopen={result.reopen_ms:8.2f} ms",
                 flush=True,
             )
-        churn = run_churn(
-            base,
-            args.workdir / f"{variant}-churn.db",
-            extension,
-            args.rows,
-            args.dimensions,
-            args.churn_rounds,
-        )
-        print(
-            f"{'churn':24} commit p50={churn['commit_ms_median']:9.2f} ms "
-            f"WAL p50={churn['wal_bytes_median'] / 1_048_576:9.2f} MiB",
-            flush=True,
-        )
+            if not args.keep_databases:
+                remove_database(args.workdir / f"{variant}-{name}.db")
+        churn = None
+        if not selected or "churn" in selected:
+            churn = run_churn(
+                base,
+                args.workdir / f"{variant}-churn.db",
+                extension,
+                args.rows,
+                args.dimensions,
+                args.churn_rounds,
+            )
+            print(
+                f"{'churn':24} commit p50={churn['commit_ms_median']:9.2f} ms "
+                f"WAL p50={churn['wal_bytes_median'] / 1_048_576:9.2f} MiB",
+                flush=True,
+            )
+            if not args.keep_databases:
+                remove_database(args.workdir / f"{variant}-churn.db")
         output["variants"][variant] = {
             "extension": str(extension),
             "cases": [asdict(result) for result in results],
@@ -326,7 +382,11 @@ def main() -> None:
                 right["search_digest"],
             ):
                 raise AssertionError(f"semantic mismatch in {left['name']}")
-        if before["churn"]["search_digest"] != after["churn"]["search_digest"]:
+        if (
+            before["churn"] is not None
+            and before["churn"]["search_digest"]
+            != after["churn"]["search_digest"]
+        ):
             raise AssertionError("semantic mismatch after churn")
         print("\nCorrectness: baseline and candidate counts and search results are identical.")
 

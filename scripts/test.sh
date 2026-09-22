@@ -83,6 +83,8 @@ then
   python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/storage.py "$extension"
   python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
+  python3 -X faulthandler tests/model_check.py "$extension" \
+    --seeds 10 --steps 20 --dimensions 512 --initial-rows 5000
   python3 -X faulthandler tests/recall_fixture.py "$extension"
   python3 -X faulthandler tests/savepoint_cost.py "$extension"
 else

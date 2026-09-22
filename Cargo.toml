@@ -19,6 +19,7 @@ loadable-entrypoint = []
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
+crc32fast = "=1.5.0"
 # The virtual-table module fills callbacks that Rusqlite 0.40 does not expose.
 # Pin the audited layout until those callbacks are available in its safe API.
 # Do not enable `modern_sqlite`: a loadable extension must use its host's API

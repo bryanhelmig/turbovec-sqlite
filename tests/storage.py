@@ -47,12 +47,16 @@ def insert_many(db: sqlite3.Connection) -> None:
 
 
 def payload(db: sqlite3.Connection) -> bytes:
-    chunks = db.execute("select chunk_id,data from v_chunks order by chunk_id").fetchall()
+    chunks = db.execute(
+        "select chunk_id,data from v_chunks where chunk_id>=0 order by chunk_id"
+    ).fetchall()
     assert [row[0] for row in chunks] == list(range(len(chunks)))
     assert all(len(row[1]) == CHUNK_SIZE for row in chunks[:-1])
     assert 0 < len(chunks[-1][1]) <= CHUNK_SIZE
     data = b"".join(row[1] for row in chunks)
-    assert len(data) == db.execute("select byte_len from v_meta").fetchone()[0]
+    stored_len = db.execute("select byte_len from v_meta").fetchone()[0]
+    expected_len = -stored_len - 1 if stored_len < 0 else stored_len
+    assert len(data) == expected_len
     return data
 
 
@@ -110,7 +114,7 @@ def corruption_worker(extension: Path, database: Path, query: str) -> None:
     try:
         db.execute(query).fetchall()
     except sqlite3.DatabaseError as cause:
-        assert "TurboVec" in str(cause), cause
+        assert "turbovec" in str(cause).lower(), cause
     else:
         raise AssertionError("corrupt storage unexpectedly loaded")
     finally:
@@ -149,6 +153,52 @@ def corruption_regression(extension: Path) -> None:
                 )
                 assert child.returncode == 0, (name, query, child.returncode, child.stderr)
 
+    # Delta records are independently framed and checksummed. Losing the
+    # entire log must also fail closed instead of exposing the stale base.
+    with tempfile.TemporaryDirectory(prefix="turbovec-delta-corruption-") as directory:
+        root = Path(directory)
+        base = root / "base.db"
+        db = connect(extension, base)
+        create(db)
+        insert_many(db)
+        db.commit()
+        db.execute(
+            "insert into v(rowid,embedding) values(?,?)", (ROWS + 1, OTHER)
+        )
+        db.commit()
+        assert db.execute(
+            "select count(*) from v_chunks where chunk_id<0"
+        ).fetchone() == (1,)
+        db.execute("pragma wal_checkpoint(truncate)")
+        db.close()
+        delta_cases = {
+            "missing_delta": "delete from v_chunks where chunk_id<0",
+            "bad_checksum": (
+                "update v_chunks set data=cast(substr(data,1,length(data)-4)||x'00000000' as blob) "
+                "where chunk_id<0"
+            ),
+            "wrong_delta_id": "update v_chunks set chunk_id=chunk_id-7 where chunk_id<0",
+        }
+        for name, mutation in delta_cases.items():
+            database = root / f"{name}.db"
+            shutil.copyfile(base, database)
+            with sqlite3.connect(database) as db:
+                db.execute(mutation)
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    str(extension),
+                    "--corrupt-worker",
+                    str(database),
+                    "select count(*) from v",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert child.returncode == 0, (name, child.returncode, child.stderr)
+
 
 def streaming_regression(extension: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="turbovec-storage-") as directory:
@@ -184,7 +234,10 @@ def streaming_regression(extension: Path) -> None:
         expected = db.execute(
             "select turbovec_add(turbovec_remove(?,1),1,?)", (expected, OTHER)
         ).fetchone()[0]
-        assert payload(db) == expected
+        # A small replacement is an O(changes) delta, not a rewritten base.
+        info = db.execute("select turbovec_info('v')").fetchone()[0]
+        assert '"delta_operations":1' in info, info
+        assert payload(db) != expected
         assert reader.execute(
             "select score from v where embedding match ? and rowid=1 order by score desc limit 1",
             (VECTOR,),
@@ -195,6 +248,32 @@ def streaming_regression(extension: Path) -> None:
             (VECTOR,),
         ).fetchone() != original
         reader.close()
+
+        # A failed delta commit leaves both SQLite storage and the lazy warm
+        # cache at the previous committed generation.
+        stable = db.execute(
+            "select score from v where embedding match ? and rowid=1 "
+            "order by score desc limit 1",
+            (OTHER,),
+        ).fetchone()
+        db.execute(
+            "create trigger fail_delta before insert on v_chunks "
+            "when new.chunk_id<0 begin select raise(abort,'forced delta failure'); end"
+        )
+        db.execute("insert or replace into v(rowid,embedding) values(1,?)", (VECTOR,))
+        try:
+            db.commit()
+        except sqlite3.IntegrityError as cause:
+            assert "forced delta failure" in str(cause), cause
+        else:
+            raise AssertionError("injected delta commit failure did not fire")
+        db.rollback()
+        assert db.execute(
+            "select score from v where embedding match ? and rowid=1 "
+            "order by score desc limit 1",
+            (OTHER,),
+        ).fetchone() == stable
+        db.execute("drop trigger fail_delta")
 
         db.execute("delete from v")
         db.commit()
