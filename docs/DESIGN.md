@@ -48,26 +48,31 @@ full compressed scan plus selection. Correctness does not depend on locality.
 turbovec0 virtual table
     ├── warmed IdMapIndex (per SQLite connection)
     ├── <name>_meta      dimensions, bit width, generation, byte length
-    └── <name>_chunks    ordered 4 MiB serialized-index chunks
+    └── <name>_chunks    4 MiB base chunks plus committed delta batches
 ```
 
 `xBegin` starts an empty change log and `xSavepoint` records only its current
-position. Insert rollback removes appended rowids in reverse order. Before the
-first delete or replacement, the module takes one lazy serialized checkpoint;
-rollback restores it and replays only later changes. This keeps SQLite's
-statement-savepoint churn independent of index size without retaining raw
-vectors for an insert-only bulk load. Exact compressed-row undo remains an
-upstream TurboVec API opportunity.
+position. Insert-only rollback removes appended rowids in reverse order.
+Ordinary deletes and replacements take no full-index checkpoint. If SQLite
+actually rolls back a destructive savepoint, the module reloads the committed
+index and replays the retained prefix. A full transaction rollback marks the
+warm copy stale and reloads it after SQLite has rolled back shadow writes. The
+only eager-checkpoint fallback is a mixed transaction that bulk-loaded without
+retaining raw vectors before its first destructive change.
 
-At `xSync`, `IdMapIndex::write_to_writer` streams the index through a 4 MiB
-buffer. Each completed chunk is compared with one stored chunk, fetched by ID.
-Unchanged chunks are skipped; same-size chunks use incremental BLOB I/O for
-only the differing byte range; resized and new chunks use ordinary SQL. The
-final partial chunk, excess old chunks, and metadata are handled before `xSync`
-returns. SQLite errors survive the writer interface, and a guard restores the
-application's last-insert rowid on both success and failure. Commit discards the
-change log and lazy checkpoint; rollback applies them to the warm copy while
-SQLite rolls back the shadow-table writes.
+At `xSync`, changes are encoded in one checksummed delta BLOB. A delete stores
+its rowid; an insert or replacement stores its rowid and source float32 vector.
+Negative chunk IDs keep these batches separate from non-negative base chunks.
+The metadata byte length becomes a negative marker while deltas exist, which
+makes older extensions fail closed instead of ignoring newer state. Loading an
+index deserializes the base and replays delta batches in generation order.
+
+Compaction is deliberately simple. When deltas reach 25% of the base bytes,
+16 MiB, or 25% of the current row count (with a 10,000-operation floor),
+`IdMapIndex::write_to_writer` streams the current index into the existing 4 MiB
+base chunks and removes every delta. Small indexes compact immediately. SQLite
+errors survive the writer interface, and a guard preserves the application's
+last-insert rowid on both success and failure.
 
 Reads check chunk IDs, types, and lengths against metadata before reserving the
 full payload buffer. Allocation is fallible, so impossible length metadata is
@@ -125,8 +130,11 @@ calls that host API-table function directly.
 - Contentless table only: callers keep documents and raw vectors separately.
 - Explicit rowids. Insert, delete, and `INSERT OR REPLACE` are supported;
   ordinary `UPDATE` is not.
-- Commit serialization compares bounded chunks, but still traverses the complete
-  index. Loads and destructive rollback checkpoints still materialize full images.
+- Small commits append operation batches, but compaction still traverses the
+  complete index. Loading and actual destructive savepoint rollback also
+  materialize the full base image.
+- Delta inserts and replacements retain raw float32 vectors until compaction;
+  deletes retain only rowids.
 - Allowlist pushdown accepts SQLite INTEGER rowids, not arbitrary virtual-table
   column predicates. Express metadata filters as a rowid subquery.
 - No automatic content triggers or WASM build.
@@ -138,9 +146,8 @@ calls that host API-table function directly.
    made later 20,000-row, 1,536-dimensional loads about 20x faster, but changes
    to shared-state layout destabilized the `INSERT OR FAIL` savepoint contract.
    Require a minimal ABI reproducer before retrying it.
-2. Add changed-unit serialization and chunk-granular reload in TurboVec's core
-   format. SQLite already writes changed byte spans, and serialization is now
-   streamed, but the engine still visits the whole index at commit.
+2. Add native changed-unit serialization to TurboVec so compaction can merge
+   compressed blocks without visiting the whole index.
 3. Make the serialized form directly or lazily searchable so a one-shot CLI
    does not pay a full transform before its first query.
 

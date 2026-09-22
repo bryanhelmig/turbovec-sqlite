@@ -266,12 +266,14 @@ def run_churn(
     connection = connect(database, extension)
     connection.execute("select count(*) from vectors").fetchone()
     commit_ms: list[float] = []
+    mutation_ms: list[float] = []
     wal_bytes: list[int] = []
     for round_index in range(rounds):
         victims = scattered(rows, 200, offset=round_index * 977)
         first_new = rows + round_index * 200 + 1
         connection.execute("pragma wal_checkpoint(truncate)")
         connection.execute("begin immediate")
+        started = time.perf_counter_ns()
         connection.executemany("delete from vectors where rowid=?", ((rowid,) for rowid in victims))
         connection.executemany(
             "insert into vectors(rowid,embedding) values(?,?)",
@@ -280,6 +282,7 @@ def run_churn(
                 for rowid in range(first_new, first_new + 200)
             ),
         )
+        mutation_ms.append((time.perf_counter_ns() - started) / 1_000_000)
         started = time.perf_counter_ns()
         connection.commit()
         commit_ms.append((time.perf_counter_ns() - started) / 1_000_000)
@@ -288,6 +291,8 @@ def run_churn(
     result = {
         "rounds": rounds,
         "mutations_per_round": 400,
+        "mutation_ms_median": statistics.median(mutation_ms),
+        "mutation_ms_max": max(mutation_ms),
         "commit_ms_median": statistics.median(commit_ms),
         "commit_ms_max": max(commit_ms),
         "wal_bytes_median": statistics.median(wal_bytes),
@@ -343,7 +348,8 @@ def main() -> None:
             )
             results.append(result)
             print(
-                f"{name:24} commit={result.commit_ms:9.2f} ms "
+                f"{name:24} mutate={result.mutation_ms:9.2f} ms "
+                f"commit={result.commit_ms:9.2f} ms "
                 f"WAL={result.wal_bytes / 1_048_576:9.2f} MiB "
                 f"reopen={result.reopen_ms:8.2f} ms",
                 flush=True,
@@ -361,7 +367,8 @@ def main() -> None:
                 args.churn_rounds,
             )
             print(
-                f"{'churn':24} commit p50={churn['commit_ms_median']:9.2f} ms "
+                f"{'churn':24} mutate p50={churn['mutation_ms_median']:9.2f} ms "
+                f"commit p50={churn['commit_ms_median']:9.2f} ms "
                 f"WAL p50={churn['wal_bytes_median'] / 1_048_576:9.2f} MiB",
                 flush=True,
             )
