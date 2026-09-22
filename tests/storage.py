@@ -184,6 +184,7 @@ def corruption_regression(extension: Path) -> None:
             shutil.copyfile(base, database)
             with sqlite3.connect(database) as db:
                 db.execute(mutation)
+            db.close()
             child = subprocess.run(
                 [
                     sys.executable,
