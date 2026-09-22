@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.6 — 2026-09-22
+
+- Make small commits proportional to changed vectors instead of total index
+  size. Commits append checksummed operation batches; bounded lazy compaction
+  occasionally folds them into the existing format v7 base image.
+- Remove the full-index copy from ordinary deletes and replacements. Actual
+  destructive savepoint rollback rebuilds from committed storage and replays
+  the retained transaction prefix.
+- Extend `turbovec_info()` with base, delta, and pending-operation byte counts.
+- Add a 700,000-row by 1,536-dimension WAL benchmark. It times mutation and
+  commit separately, compares released and candidate search results exactly,
+  and covers single edits, scattered and neighboring deletes, replacements,
+  and repeated churn.
+- Existing index files open without rebuilding. A database with unmerged 0.1.6
+  deltas intentionally refuses to open in 0.1.5 or older instead of silently
+  returning stale results.
+
 ## 0.1.5 — 2026-09-15
 
 - Upgrade from 0.1.4 without rebuilding indexes. The SQL API and TurboVec

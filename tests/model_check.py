@@ -18,9 +18,13 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("extension", type=Path)
     parser.add_argument("--seeds", type=int, default=100)
     parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument("--dimensions", type=int, default=8)
+    parser.add_argument("--initial-rows", type=int, default=0)
     args = parser.parse_args()
-    if args.seeds < 1 or args.steps < 1:
-        parser.error("seeds and steps must be positive")
+    if args.seeds < 1 or args.steps < 1 or args.initial_rows < 0:
+        parser.error("seeds and steps must be positive; initial-rows cannot be negative")
+    if args.dimensions < 8 or args.dimensions % 8:
+        parser.error("dimensions must be a positive multiple of 8")
     return args
 
 
@@ -32,10 +36,13 @@ def connect(database: Path, extension: Path) -> sqlite3.Connection:
     return connection
 
 
-def vector(rowid: int, version: int = 0) -> bytes:
-    values = [((rowid * 17 + version * 31 + i * 13) % 101) - 50 for i in range(8)]
+def vector(rowid: int, dimensions: int, version: int = 0) -> bytes:
+    values = [
+        ((rowid * 17 + version * 31 + i * 13) % 101) - 50
+        for i in range(dimensions)
+    ]
     norm = math.sqrt(sum(value * value for value in values))
-    return struct.pack("<8f", *(value / norm for value in values))
+    return struct.pack(f"<{dimensions}f", *(value / norm for value in values))
 
 
 def actual_ids(connection: sqlite3.Connection) -> set[int]:
@@ -61,9 +68,19 @@ def main() -> None:
         database = Path(directory) / "model.db"
         connection = connect(database, args.extension)
         connection.execute(
-            "create virtual table vectors using turbovec0(dimensions=8, bit_width=4)"
+            "create virtual table vectors using "
+            f"turbovec0(dimensions={args.dimensions}, bit_width=4)"
         )
-        expected: set[int] = set()
+        expected = set(range(1, args.initial_rows + 1))
+        if expected:
+            connection.executemany(
+                "insert into vectors(rowid,embedding) values(?,?)",
+                (
+                    (rowid, vector(rowid, args.dimensions))
+                    for rowid in sorted(expected)
+                ),
+            )
+            connection.commit()
 
         for seed in range(args.seeds):
             rng = random.Random(0x5EED + seed)
@@ -76,7 +93,7 @@ def main() -> None:
                 if choice < 30:
                     connection.execute(
                         "insert or ignore into vectors(rowid, embedding) values (?, ?)",
-                        (rowid, vector(rowid, step)),
+                        (rowid, vector(rowid, args.dimensions, step)),
                     )
                     expected.add(rowid)
                 elif choice < 50:
@@ -85,7 +102,7 @@ def main() -> None:
                 elif choice < 65:
                     connection.execute(
                         "insert or replace into vectors(rowid, embedding) values (?, ?)",
-                        (rowid, vector(rowid, step)),
+                        (rowid, vector(rowid, args.dimensions, step)),
                     )
                     expected.add(rowid)
                 elif choice < 74 and expected:
@@ -93,7 +110,7 @@ def main() -> None:
                     try:
                         connection.execute(
                             "insert or abort into vectors(rowid, embedding) values (?, ?)",
-                            (duplicate, vector(duplicate, step)),
+                            (duplicate, vector(duplicate, args.dimensions, step)),
                         )
                     except sqlite3.IntegrityError:
                         pass

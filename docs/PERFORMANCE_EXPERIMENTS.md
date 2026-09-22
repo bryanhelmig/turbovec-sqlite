@@ -219,3 +219,52 @@ WAL snapshot visibility, explicit/autocommit rowids, corruption rejection, and
 rollback plus retry after a forced failure in the third chunk. The full Python
 suite passed on both SQLite 3.44.0 and 3.53.4; real-embedding recall remained
 0.907 at 10 and 0.922 at 40. Static linking and all three language clients passed.
+
+## Change-proportional commits — September 22, 2026
+
+Version 0.1.6 separates two costs that version 0.1.5 paid on a destructive
+write. The mutation itself could serialize a rollback checkpoint, and commit
+then serialized and compared the complete index again. The replacement design
+logs row-level operations and appends one checksummed delta batch at commit.
+Deletes contain IDs only. Inserts and replacements contain IDs plus source
+float32 vectors. Lazy compaction periodically folds those batches into the
+unchanged format v7 base image.
+
+The benchmark is [`commit_scale.py`](../benchmarks/commit_scale.py). Its default
+shape is the production geometry: 700,000 rows, 1,536 dimensions, 4-bit codes,
+WAL mode, `synchronous=FULL`, and disabled automatic WAL checkpoints. One base
+database is copied for every independent case. Each database is reopened,
+checked with `integrity_check`, and searched with four fixed queries. With
+`--baseline-extension`, row counts and the complete top-40 rowid/score digest
+must match exactly.
+
+```sh
+python3 benchmarks/commit_scale.py \
+  --baseline-extension /path/to/0.1.5/libturbovec_sqlite.dylib \
+  --extension target/release/libturbovec_sqlite.dylib \
+  --workdir /fast/local/turbovec-commit-scale \
+  --json /tmp/turbovec-commit-scale.json
+```
+
+Apple M1, macOS 26.6.1, SQLite 3.53.4. The base database was 523 MiB.
+
+| Case | 0.1.5 mutate | 0.1.5 commit | 0.1.6 mutate | 0.1.6 commit | WAL before / after |
+|---|---:|---:|---:|---:|---:|
+| Insert 1 | 9.4 ms | 375.2 ms | 9.1 ms | 0.4 ms | 12 KiB / 32 KiB |
+| Insert 200 | 17.7 ms | 441.9 ms | 10.8 ms | 3.6 ms | 2.49 MiB / 1.21 MiB |
+| Delete 1 | 132.9 ms | 304.4 ms | 10.3 ms | 0.3 ms | 2.36 MiB / 8 KiB |
+| Delete 200 scattered | 129.8 ms | 876.6 ms | 6.7 ms | 0.4 ms | 196.01 MiB / 28 KiB |
+| Delete 200 neighboring | 160.1 ms | 311.2 ms | 5.9 ms | 0.4 ms | 2.35 MiB / 28 KiB |
+| Delete 5,000 scattered | 163.6 ms | 1,273.8 ms | 45.5 ms | 0.7 ms | 514.17 MiB / 72 KiB |
+| Replace 200 scattered | 166.5 ms | 797.1 ms | 10.7 ms | 3.3 ms | 187.15 MiB / 1.21 MiB |
+| Replace 5,000 scattered | 256.9 ms | 1,327.2 ms | 137.7 ms | 78.1 ms | 516.52 MiB / 29.57 MiB |
+
+Twenty rounds of 200 scattered deletes plus 200 inserts had a median commit of
+742.3 ms and 189.49 MiB WAL on 0.1.5, versus 3.3 ms and 1.21 MiB on 0.1.6.
+All compared search digests and row counts were identical.
+
+The 5,000-delete case did not reproduce the reported 9-second commit. On the
+released implementation it spent 1.27 seconds committing and wrote 514 MiB,
+so complete serialization and WAL I/O still dominated. The candidate spent
+45.5 ms mutating, 0.7 ms committing, and wrote 72 KiB. The isolated result does
+not justify tuning for the one heavily loaded 9-second observation.

@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.1.5
+version=0.1.6
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.1.5-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.1.6-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -132,40 +132,55 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.1.5
+-- 0.1.6
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
 --  "bit_width":4,"dimensions":1536,"serialized_bytes":...,
+--  "base_bytes":...,"delta_bytes":...,"delta_operations":...,
 --  "format_version":7,"format_revision":2}
 ```
 
 Applications can parse `turbovec_version()` at connection setup and fail fast
-when a required fix is absent. `turbovec_info()` reads the complete serialized
-index, so treat it as diagnostics rather than a hot-path query.
+when a required fix is absent. `turbovec_info()` opens and validates the index,
+so treat it as diagnostics rather than a hot-path query.
 
 See [`examples/demo.sql`](examples/demo.sql) for a complete CLI example.
 
 ## What things cost
 
-The warm index is per connection. Measurements with version 0.1.4 on a
-370,000-vector, 1,536-dimensional, 4-bit integration produced this operating
-model at roughly 280 MB serialized:
+The warm index is per connection. Opening it remains O(index), so hold a
+connection open when the host permits it. Since 0.1.6, ordinary write cost is
+proportional to the changes:
 
-| Operation | Current cost | Observed time |
-|---|---|---:|
-| First query on a connection | O(index) load | about 0.3 s |
-| Commit after a vector write | O(index) serialization | about 0.25 s |
-| First delete/replace per transaction | lazy O(index) copy | about 85 ms |
-| Insert and savepoint bookkeeping | O(changes), since 0.1.2 | near-zero |
+- deletes append rowids;
+- inserts and replacements append rowids plus float32 vectors;
+- a no-op transaction writes nothing;
+- lazy compaction occasionally rebuilds the base image after deltas reach 25%
+  of the base, 16 MiB, or 25% of the row count (with sensible minimums).
 
-These values describe one integration, not a hardware promise. The consequences
-are simple:
+An Apple M1 benchmark used SQLite 3.53.4 in WAL/FULL mode and a 700,000-row,
+1,536-dimensional, 4-bit index (about 523 MiB). Mutation and commit are timed
+separately:
+
+| Operation | 0.1.5 mutation / commit | 0.1.6 mutation / commit | 0.1.5 / 0.1.6 WAL |
+|---|---:|---:|---:|
+| Delete 1 | 132.9 / 304.4 ms | 10.3 / 0.3 ms | 2.36 MiB / 8 KiB |
+| Delete 200 scattered | 129.8 / 876.6 ms | 6.7 / 0.4 ms | 196.01 MiB / 28 KiB |
+| Delete 200 neighboring | 160.1 / 311.2 ms | 5.9 / 0.4 ms | 2.35 MiB / 28 KiB |
+| Delete 5,000 scattered | 163.6 / 1,273.8 ms | 45.5 / 0.7 ms | 514.17 MiB / 72 KiB |
+| Replace 5,000 scattered | 256.9 / 1,327.2 ms | 137.7 / 78.1 ms | 516.52 MiB / 29.57 MiB |
+
+Counts and top-40 rowids and scores were identical between versions for every
+case. These are measurements, not hardware promises. Reproduce them with
+[`benchmarks/commit_scale.py`](benchmarks/commit_scale.py).
+
+The operational advice is simple:
 
 1. Hold a connection open when the host permits it. A one-shot CLI pays the
    load on every run.
-2. Batch vector writes in one transaction. A one-row commit can cost nearly as
-   much as a large batch.
+2. Batch related vector writes in one transaction. It reduces SQLite and fsync
+   overhead even though small vector commits are now cheap.
 
 ```sql
 begin immediate;
@@ -175,13 +190,10 @@ delete from document_vectors where rowid = :old_id;
 commit;
 ```
 
-Put inserts before deletes or replacements in a large mixed transaction. The
-first destructive write creates the lazy rollback checkpoint.
-
-Since 0.1.5, commits stream serialization through a 4 MiB buffer and
-compare one stored chunk at a time. This avoids holding complete old and new
-serialized images during commit, while still doing O(index) work. Initial loads
-and the destructive rollback checkpoint still require full-index memory.
+Ordinary deletes do not copy the index for rollback. If SQLite actually rolls
+back a destructive savepoint, the extension reloads the committed base and
+replays the retained transaction prefix. That makes the common path cheap and
+moves O(index) work to the rare rollback path.
 
 ## Keep content and vectors in sync
 
@@ -289,9 +301,11 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and disk format are separate. Version 0.1.5 writes TurboVec
-format v7, revision 2, unchanged from 0.1.4; no index rebuild is needed for this
-upgrade. During 0.x, a release may intentionally break disk
+The crate version and base disk format are separate. Version 0.1.6 reads the
+same TurboVec format v7, revision 2 base image as 0.1.5, so no index rebuild is
+needed. Small commits may add extension-owned delta records. Older versions
+refuse an index while those deltas are present instead of silently ignoring
+them. During 0.x, a release may intentionally break disk
 compatibility and will say so in the changelog. The extension checks the header
 before deserialization and refuses another format or revision with a specific
 error. Keep a recoverable copy of source embeddings.
