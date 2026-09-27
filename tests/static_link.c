@@ -122,6 +122,17 @@ int main(void) {
 
     sqlite3_finalize(statement);
 
+    /* A static build inherits whatever libsqlite3 the host linked, which can be
+     * older than the 3.44 this project supports. turbovec0 needs API-table
+     * callbacks added in 3.38, so below that only the scalar functions are
+     * usable and there is nothing here to assert. Ubuntu 22.04 ships 3.37. */
+    if (sqlite3_libversion_number() < 3038000) {
+        printf("skipping turbovec0 static checks: host SQLite is %s, need 3.38.0\n",
+               sqlite3_libversion());
+        sqlite3_close(database);
+        return 0;
+    }
+
     if (check_virtual_table(database) != 0) {
         sqlite3_close(database);
         return 1;

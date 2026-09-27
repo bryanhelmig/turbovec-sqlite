@@ -36,6 +36,11 @@
   the model expects, not only that the rowid exists. Exercise `turbovec0`
   creation, insertion, search, and damaged-storage reporting from the
   statically linked C smoke test.
+- Say why `turbovec0` is unavailable on a host below SQLite 3.38, naming the
+  required and found versions, instead of reporting a missing internal callback.
+  A statically linked build inherits whatever `libsqlite3` it was linked
+  against, so this is the message that path produces; the scalar `turbovec_*`
+  functions keep working there.
 
 ## 0.1.6 — 2026-09-22
 

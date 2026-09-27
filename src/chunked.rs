@@ -51,6 +51,11 @@ const PLAN_HAS_OFFSET: c_int = 0x40;
 const PLAN_HAS_ROWID_FILTER: c_int = 0x80;
 const PLAN_ROWID_FILTER_IN: c_int = 0x100;
 
+/// Lowest host SQLite that exposes every API-table slot `turbovec0` reads. The
+/// project declares 3.44, but this is the version the module actually cannot
+/// proceed without, so it is the version the error names.
+const MIN_HOST_VERSION: c_int = 3_038_000;
+
 // sqlite3_api_routines pointer slots from SQLite's stable sqlite3ext.h ABI.
 // The IN callbacks were appended in SQLite 3.38; this project supports 3.44+.
 const API_LIBVERSION_NUMBER: usize = 67;
@@ -105,6 +110,7 @@ const _: () = assert!(
 
 static ORIGINAL_BEST_INDEX: OnceLock<usize> = OnceLock::new();
 static ORIGINAL_FILTER: OnceLock<usize> = OnceLock::new();
+static HOST_VERSION: OnceLock<c_int> = OnceLock::new();
 static VTAB_CONFIG: OnceLock<usize> = OnceLock::new();
 static VTAB_RHS_VALUE: OnceLock<usize> = OnceLock::new();
 static VTAB_IN: OnceLock<usize> = OnceLock::new();
@@ -128,7 +134,9 @@ pub(crate) unsafe fn initialize_api(api: *mut ffi::sqlite3_api_routines) {
         return;
     }
     let version: unsafe extern "C" fn() -> c_int = unsafe { std::mem::transmute(version_pointer) };
-    if unsafe { version() } < 3_038_000 {
+    let host_version = unsafe { version() };
+    let _ = HOST_VERSION.set(host_version);
+    if host_version < MIN_HOST_VERSION {
         return;
     }
     for (slot, destination) in [
@@ -1174,9 +1182,28 @@ impl TurboVecTable {
         // SQLITE_VTAB_CONSTRAINT_SUPPORT is the only config option here with
         // a variadic third argument. Rusqlite 0.40's convenience method omits
         // it, so call the host API-table function directly.
-        let pointer = *VTAB_CONFIG
-            .get()
-            .ok_or_else(|| error("SQLite virtual-table config callback is unavailable"))?;
+        let pointer = *VTAB_CONFIG.get().ok_or_else(|| {
+            // Naming the missing callback described the symptom. The cause is
+            // almost always a host older than the callbacks this module needs,
+            // which a static build inherits from whatever libsqlite3 it linked
+            // against — so say that, and say which version it found.
+            match HOST_VERSION.get() {
+                Some(version) if *version < MIN_HOST_VERSION => error(format!(
+                    "turbovec0 requires SQLite {}.{}.{} or newer; this host is {}.{}.{}. \
+                     The scalar turbovec_* functions still work.",
+                    MIN_HOST_VERSION / 1_000_000,
+                    MIN_HOST_VERSION / 1_000 % 1_000,
+                    MIN_HOST_VERSION % 1_000,
+                    version / 1_000_000,
+                    version / 1_000 % 1_000,
+                    version % 1_000,
+                )),
+                _ => error(
+                    "SQLite virtual-table config callback is unavailable; turbovec0 needs the \
+                     host's extension API table",
+                ),
+            }
+        })?;
         let callback: VtabConfigCallback = unsafe { std::mem::transmute(pointer) };
         let result =
             unsafe { callback(db.handle(), ffi::SQLITE_VTAB_CONSTRAINT_SUPPORT, 1 as c_int) };
