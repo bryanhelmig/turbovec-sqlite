@@ -27,9 +27,19 @@ A SQLite virtual table is both a planner protocol and a transaction participant:
 - `xShadowName` identifies extension-owned implementation tables.
 
 `turbovec0` consumes `embedding MATCH ?`, integer `rowid IN (...)`, ordinary
-`LIMIT`, and descending score order. A hidden `k` constraint remains as
-compatibility syntax. It supports point rowid lookup and full rowid scans for
-ordinary SQLite operations such as `DELETE` and `count(*)`.
+`LIMIT`, and descending score order. A hidden `k` constraint names the candidate
+count where `LIMIT` cannot reach, which is what makes a join-driven batch of
+queries work. It supports point rowid lookup and full rowid scans for ordinary
+SQLite operations such as `DELETE` and `count(*)`.
+
+SQLite offers each join order to `xBestIndex` in turn, and in some of them the
+query vector is not yet in scope, so the `MATCH` arrives unusable. The module
+declines those orders rather than failing the statement, leaving SQLite free to
+find the order that works. The cost is that a statement no order can serve
+reports SQLite's generic "no query solution" instead of a tailored message; the
+benefit is that `queries q join v on v.embedding match q.embedding and v.k = n`
+plans at all. When the planner can see the `k` or `LIMIT` value, the module
+reports it as the plan's row count so surrounding joins are sized correctly.
 
 SQLite presents `IN` to `xBestIndex` as an equality constraint. The module uses
 SQLite's all-at-once IN API to receive the complete rowid set in one cursor
@@ -74,14 +84,32 @@ base chunks and removes every delta. Small indexes compact immediately. SQLite
 errors survive the writer interface, and a guard preserves the application's
 last-insert rowid on both success and failure.
 
-Reads check chunk IDs, types, and lengths against metadata before reserving the
-full payload buffer. Allocation is fallible, so impossible length metadata is
-reported as an error rather than aborting the host process.
+The byte budget is additionally capped at the base image. Base size is not
+proportional to row count: a high-dimensional index carries a fixed rotation and
+codebook cost, and an *empty* 1,536-dimension base already serializes to
+1.67 MiB. Against a flat 16 MiB floor that let a few thousand rows sit as raw
+float32 deltas several times larger than the 4-bit base describing them, paid
+again on every cold open. Capping the budget at the base keeps deltas from
+deferring more work than the rewrite they are avoiding, and leaves the
+small-commit behavior on a large index untouched.
+
+Reads check chunk IDs, types, and lengths against metadata before any content is
+loaded, so impossible length metadata is rejected without ever sizing an
+allocation from it. The chunks themselves are then streamed into TurboVec's
+loader through incremental BLOB I/O rather than assembled into a buffer first:
+`IdMapIndex::from_bytes` copies whatever slice it is handed, so materializing the
+image kept two full copies alive for the length of the open.
 
 Every committed write increments `generation`. A reader checks this cheap value
-before using its cache and reloads chunks if another connection committed a new
-generation. The shadow tables remain normal SQLite storage, so WAL, backup,
-atomic commit, and crash recovery stay SQLite's job.
+before using its cache. When only delta batches have appeared since its own
+generation it replays those and keeps its warm index; otherwise it rebuilds. The
+base image is provably unchanged whenever the oldest surviving delta is no newer
+than the reader's generation, because compaction rewrites the base and deletes
+every delta in one statement — a delta older than the reader could not have
+survived one. Replay applies to the live copy, so the reader marks itself for a
+full reload before starting and clears that only after a complete, contiguous
+catch-up. The shadow tables remain normal SQLite storage, so WAL, backup, atomic
+commit, and crash recovery stay SQLite's job.
 
 The reference BLOB functions are the simplest oracle, but each mutation and
 search deserializes the full BLOB. The virtual table keeps the index warm and
@@ -121,7 +149,12 @@ by bit width.
 Rusqlite 0.40 does not expose savepoint, shadow-name, or integrity module
 callbacks through its builder. This crate pins 0.40.2 and locally fills those
 callbacks in its `sqlite3_module`. That small compatibility seam should be
-removed when Rusqlite exposes them. Its configuration wrapper also omits the
+removed when Rusqlite exposes them. `xIntegrity` is appended past the end of
+Rusqlite's struct, which is only correct while that struct stops at
+`xShadowName`; `libsqlite3-sys` arrives transitively, and a version that grew
+the struct would turn the appended field into bytes SQLite never reads and stop
+`PRAGMA integrity_check` from reaching `turbovec0` with no diagnostic at all. A
+compile-time offset assertion fails the build instead. Its configuration wrapper also omits the
 variadic value required by `SQLITE_VTAB_CONSTRAINT_SUPPORT`, so this crate
 calls that host API-table function directly.
 
@@ -131,8 +164,11 @@ calls that host API-table function directly.
 - Explicit rowids. Insert, delete, and `INSERT OR REPLACE` are supported;
   ordinary `UPDATE` is not.
 - Small commits append operation batches, but compaction still traverses the
-  complete index. Loading and actual destructive savepoint rollback also
-  materialize the full base image.
+  complete index, and actual destructive savepoint rollback still materializes
+  the full base image.
+- Opening an index still holds one full copy of the byte image alongside the
+  index built from it, because TurboVec's loader reads its input into an owned
+  buffer. A constructor that consumes a `Vec<u8>` would remove the last copy.
 - Delta inserts and replacements retain raw float32 vectors until compaction;
   deletes retain only rowids.
 - Allowlist pushdown accepts SQLite INTEGER rowids, not arbitrary virtual-table
@@ -150,6 +186,14 @@ calls that host API-table function directly.
    compressed blocks without visiting the whole index.
 3. Make the serialized form directly or lazily searchable so a one-shot CLI
    does not pay a full transform before its first query.
+4. Fit the TQ+ calibration. Every `turbovec0` index is uncalibrated today, which
+   TurboVec measures at roughly 2.5 pp R@10 on average and up to 8.7 pp on the
+   most anisotropic data — the largest single recall lever available. The
+   extension already sees raw float32 vectors on insert, so a reservoir sample
+   held in `_meta` and a `calibrate` at the next compaction would fit the
+   existing generation machinery. `calibrate` re-encodes every stored row, so
+   the sampling, freezing, and re-calibration policy needs deciding first, and
+   the checked-in GloVe gate should quantify the gain before the design lands.
 
 Opt-in trigger use is a separate security/API decision. `DIRECTONLY` remains
 the safe default.

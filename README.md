@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.1.6
+version=0.2.0
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.1.6-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.2.0-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -124,6 +124,18 @@ limit 10;
 Do not fetch a fixed 10x candidate set and filter afterward. A selective
 metadata filter can discard all of it.
 
+Run one KNN per row of a query table by joining and naming `k` explicitly.
+Ordinary `LIMIT` cannot be pushed into a join, so the hidden `k` column is how
+the candidate count is expressed here:
+
+```sql
+select q.qid, v.rowid, v.score
+from query_batch q
+join document_vectors v
+  on v.embedding match q.embedding and v.k = 10
+order by q.qid, v.score desc;
+```
+
 Scores are approximate inner products; larger is better. Normalize vectors
 when cosine ranking is desired. Ordinary `UPDATE` is not supported—use
 `INSERT OR REPLACE`.
@@ -132,7 +144,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.1.6
+-- 0.2.0
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
@@ -157,7 +169,14 @@ proportional to the changes:
 - inserts and replacements append rowids plus float32 vectors;
 - a no-op transaction writes nothing;
 - lazy compaction occasionally rebuilds the base image after deltas reach 25%
-  of the base, 16 MiB, or 25% of the row count (with sensible minimums).
+  of the base, 16 MiB, or 25% of the row count (with sensible minimums), and
+  never lets deltas outgrow the base image itself.
+
+A reader holding a connection open no longer rebuilds its warm index when
+another connection commits: it replays only the committed delta batches. On a
+20,000-row, 1,536-dimensional index, a reader's first query after a concurrent
+one-row commit costs about 1.4 ms rather than 7.6–12.3 ms. A compaction still
+forces a full reload.
 
 An Apple M1 benchmark used SQLite 3.53.4 in WAL/FULL mode and a 700,000-row,
 1,536-dimensional, 4-bit index (about 523 MiB). Mutation and commit are timed
@@ -301,11 +320,12 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and base disk format are separate. Version 0.1.6 reads the
-same TurboVec format v7, revision 2 base image as 0.1.5, so no index rebuild is
-needed. Small commits may add extension-owned delta records. Older versions
-refuse an index while those deltas are present instead of silently ignoring
-them. During 0.x, a release may intentionally break disk
+The crate version and base disk format are separate. Version 0.2.0 reads and
+writes the same TurboVec format v7, revision 2 base image, shadow schema, and
+delta records as 0.1.6, so no index rebuild is needed in either direction. What
+0.2.0 changed is when compaction runs, not what it produces. Small commits may
+add extension-owned delta records. Versions before 0.1.6 refuse an index while
+those deltas are present instead of silently ignoring them. During 0.x, a release may intentionally break disk
 compatibility and will say so in the changelog. The extension checks the header
 before deserialization and refuses another format or revision with a specific
 error. Keep a recoverable copy of source embeddings.

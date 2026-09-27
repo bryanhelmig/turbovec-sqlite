@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.0 — 2026-09-26
+
+- Bring a warm reader forward by replaying only the delta batches other
+  connections committed, instead of rebuilding the whole index. A reader's first
+  query after a concurrent one-row commit dropped from 7.6–12.3 ms to about
+  1.4 ms on a 20,000-row by 1,536-dimension index; the saving grows with index
+  size. A compaction, a gap in the delta chain, or any other surprise still
+  falls back to the full read.
+- Cap the delta budget at the base image. A high-dimensional index pays a fixed
+  rotation and codebook cost — an empty 1,536-dimension base already serializes
+  to 1.67 MiB — so the 16 MiB floor alone let small tables accumulate raw
+  float32 deltas several times larger than the 4-bit base they described. A
+  fresh 2,000-row by 1,536-dimension table now stores 3.21 MiB instead of
+  13.97 MiB, and its cold open plus first query fell from 27 ms to 1 ms. Small
+  commits on a large index are unchanged.
+- Stream base chunks straight into TurboVec's loader instead of materializing
+  the image first. `IdMapIndex::from_bytes` copies what it is handed, so opening
+  an index held two full copies; peak growth on a 48.5 MiB image fell from
+  104 MiB to 61 MiB.
+- Plan joins whose `MATCH` is unusable in one loop order. `xBestIndex` now
+  declines those orders instead of failing the statement, so batch KNN over a
+  table of queries works: `queries q join v on v.embedding match q.embedding
+  and v.k=n`. A query no order can serve reports SQLite's "no query solution"
+  rather than a tailored message.
+- Report the planned top-k as the KNN plan's estimated row count instead of a
+  fixed 10, and keep `xBestIndex` off the blocking path when another statement
+  holds the warm index.
+- Free the previous virtual-table error message before replacing it. SQLite's
+  savepoint callbacks never reclaim it, so a failing `xSavepoint`, `xRelease`,
+  or `xRollbackTo` leaked its message.
+- Fail the build if a future `libsqlite3-sys` grows `sqlite3_module`, which
+  would silently stop `PRAGMA integrity_check` from reaching `turbovec0`.
+- Assert in the transaction model check that each rowid holds the vector version
+  the model expects, not only that the rowid exists. Exercise `turbovec0`
+  creation, insertion, search, and damaged-storage reporting from the
+  statically linked C smoke test.
+
 ## 0.1.6 — 2026-09-22
 
 - Make small commits proportional to changed vectors instead of total index

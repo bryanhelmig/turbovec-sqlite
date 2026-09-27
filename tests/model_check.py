@@ -37,10 +37,22 @@ def connect(database: Path, extension: Path) -> sqlite3.Connection:
 
 
 def vector(rowid: int, dimensions: int, version: int = 0) -> bytes:
-    values = [
-        ((rowid * 17 + version * 31 + i * 13) % 101) - 50
-        for i in range(dimensions)
-    ]
+    """A vector that is near-orthogonal to every other (rowid, version) pair.
+
+    The model asserts *which* vector each rowid holds, not just that the rowid
+    exists, so different versions of one rowid have to be distinguishable under
+    4-bit quantization. Correlated versions would let a retained stale vector
+    score as a match. Measured self-match is >= 0.996 down to 8 dimensions,
+    against a cross-version maximum of 0.66.
+    """
+    state = (rowid * 0x9E3779B97F4A7C15 + version * 0xBF58476D1CE4E5B9) | 1
+    values = []
+    for _ in range(dimensions):
+        state ^= (state << 13) & 0xFFFFFFFFFFFFFFFF
+        state ^= state >> 7
+        state ^= (state << 17) & 0xFFFFFFFFFFFFFFFF
+        state &= 0xFFFFFFFFFFFFFFFF
+        values.append(((state >> 40) / float(1 << 23)) - 0.5)
     norm = math.sqrt(sum(value * value for value in values))
     return struct.pack(f"<{dimensions}f", *(value / norm for value in values))
 
@@ -49,15 +61,41 @@ def actual_ids(connection: sqlite3.Connection) -> set[int]:
     return {row[0] for row in connection.execute("select rowid from vectors")}
 
 
-def assert_model(connection: sqlite3.Connection, expected: set[int]) -> None:
+# A stored vector that matches its expected version scores ~1.0; any other
+# version of the same rowid scores well under this.
+SELF_MATCH_FLOOR = 0.9
+
+
+def assert_model(
+    connection: sqlite3.Connection,
+    expected: dict[int, int],
+    dimensions: int,
+    sample: set[int] = frozenset(),
+) -> None:
     actual = actual_ids(connection)
-    if actual != expected:
-        missing = sorted(expected - actual)[:10]
-        extra = sorted(actual - expected)[:10]
+    if actual != expected.keys():
+        missing = sorted(expected.keys() - actual)[:10]
+        extra = sorted(actual - expected.keys())[:10]
         raise AssertionError(f"model mismatch: missing={missing}, extra={extra}")
     count = connection.execute("select count(*) from vectors").fetchone()[0]
     if count != len(expected):
         raise AssertionError(f"count mismatch: SQLite={count}, model={len(expected)}")
+    # Content check on the rowids this transaction actually touched: they are
+    # the only ones whose stored vector could have gone stale.
+    for rowid in sorted(sample & expected.keys())[:12]:
+        version = expected[rowid]
+        row = connection.execute(
+            "select score from vectors where embedding match ? and rowid=? "
+            "order by score desc limit 1",
+            (vector(rowid, dimensions, version), rowid),
+        ).fetchone()
+        if row is None:
+            raise AssertionError(f"rowid {rowid} is absent from a KNN scan")
+        if row[0] < SELF_MATCH_FLOOR:
+            raise AssertionError(
+                f"rowid {rowid} scores {row[0]:.3f} against version {version}; "
+                "it is holding some other version's vector"
+            )
 
 
 def main() -> None:
@@ -71,57 +109,67 @@ def main() -> None:
             "create virtual table vectors using "
             f"turbovec0(dimensions={args.dimensions}, bit_width=4)"
         )
-        expected = set(range(1, args.initial_rows + 1))
+        # rowid -> the version of the vector that rowid must be holding.
+        expected = {rowid: 0 for rowid in range(1, args.initial_rows + 1)}
         if expected:
             connection.executemany(
                 "insert into vectors(rowid,embedding) values(?,?)",
                 (
-                    (rowid, vector(rowid, args.dimensions))
-                    for rowid in sorted(expected)
+                    (rowid, vector(rowid, args.dimensions, version))
+                    for rowid, version in sorted(expected.items())
                 ),
             )
             connection.commit()
 
         for seed in range(args.seeds):
             rng = random.Random(0x5EED + seed)
-            before = set(expected)
-            savepoint: set[int] | None = None
+            before = dict(expected)
+            savepoint: dict[int, int] | None = None
+            touched: set[int] = set()
             connection.execute("begin immediate")
             for step in range(args.steps):
                 choice = rng.randrange(100)
                 rowid = rng.randrange(1, args.seeds * 4 + 65)
+                # Versions must not repeat across steps for one rowid, or a
+                # stale vector could pass the content check by coincidence.
+                version = step + 1
                 if choice < 30:
                     connection.execute(
                         "insert or ignore into vectors(rowid, embedding) values (?, ?)",
-                        (rowid, vector(rowid, args.dimensions, step)),
+                        (rowid, vector(rowid, args.dimensions, version)),
                     )
-                    expected.add(rowid)
+                    # OR IGNORE leaves an existing row, and its vector, alone.
+                    expected.setdefault(rowid, version)
+                    touched.add(rowid)
                 elif choice < 50:
                     connection.execute("delete from vectors where rowid=?", (rowid,))
-                    expected.discard(rowid)
+                    expected.pop(rowid, None)
                 elif choice < 65:
                     connection.execute(
                         "insert or replace into vectors(rowid, embedding) values (?, ?)",
-                        (rowid, vector(rowid, args.dimensions, step)),
+                        (rowid, vector(rowid, args.dimensions, version)),
                     )
-                    expected.add(rowid)
+                    expected[rowid] = version
+                    touched.add(rowid)
                 elif choice < 74 and expected:
                     duplicate = rng.choice(sorted(expected))
                     try:
                         connection.execute(
                             "insert or abort into vectors(rowid, embedding) values (?, ?)",
-                            (duplicate, vector(duplicate, args.dimensions, step)),
+                            (duplicate, vector(duplicate, args.dimensions, version)),
                         )
                     except sqlite3.IntegrityError:
                         pass
                     else:
                         raise AssertionError("duplicate ABORT insert succeeded")
+                    # A refused insert must leave the stored vector untouched.
+                    touched.add(duplicate)
                 elif choice < 84 and savepoint is None:
                     connection.execute("savepoint model_point")
-                    savepoint = set(expected)
+                    savepoint = dict(expected)
                 elif choice < 93 and savepoint is not None:
                     connection.execute("rollback to model_point")
-                    expected = set(savepoint)
+                    expected = dict(savepoint)
                 elif savepoint is not None:
                     connection.execute("release model_point")
                     savepoint = None
@@ -132,12 +180,12 @@ def main() -> None:
                 expected = before
             else:
                 connection.commit()
-            assert_model(connection, expected)
+            assert_model(connection, expected, args.dimensions, touched)
 
             if seed % 10 == 9:
                 connection.close()
                 connection = connect(database, args.extension)
-                assert_model(connection, expected)
+                assert_model(connection, expected, args.dimensions, touched)
 
         reports = [row[0] for row in connection.execute("pragma integrity_check")]
         if reports != ["ok"]:

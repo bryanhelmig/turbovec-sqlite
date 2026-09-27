@@ -201,6 +201,30 @@ def main() -> None:
     ).fetchone()
     assert scalar_query == (1,)
 
+    # A join whose MATCH is unusable in one loop order must still plan in the
+    # order that works. xBestIndex declines the bad order instead of failing the
+    # statement, which is what makes batch KNN over a table of queries possible.
+    connection.execute("create table queries(qid integer primary key, embedding blob)")
+    connection.executemany(
+        "insert into queries values (?, ?)", ((1, VECTOR_X), (2, VECTOR_Y))
+    )
+    batch = connection.execute(
+        "select q.qid, v.rowid from queries q join v "
+        "on v.embedding match q.embedding and v.k=1 order by q.qid"
+    ).fetchall()
+    single = [
+        (
+            qid,
+            connection.execute(
+                "select rowid from v where embedding match ? "
+                "order by score desc limit 1",
+                (embedding,),
+            ).fetchone()[0],
+        )
+        for qid, embedding in ((1, VECTOR_X), (2, VECTOR_Y))
+    ]
+    assert batch == single, (batch, single)
+
     # xShadowName lets defensive mode reject direct writes while xSync may
     # still maintain the tables through the virtual-table implementation.
     if hasattr(connection, "setconfig") and hasattr(

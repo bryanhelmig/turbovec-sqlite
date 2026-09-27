@@ -3,13 +3,14 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_int};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
+use rusqlite::blob::Blob;
 use rusqlite::ffi;
 use rusqlite::types::{Null, ValueRef};
 use rusqlite::vtab::{
@@ -29,6 +30,12 @@ const DELTA_HEADER_LEN: usize = 12;
 const DELTA_CHECKSUM_LEN: usize = 4;
 const MIN_DELTA_BASE_BYTES: usize = 1024 * 1024;
 const MIN_COMPACTION_DELTA_BYTES: usize = 16 * 1024 * 1024;
+/// Planner fallback when the warm row count is unavailable.
+const DEFAULT_ESTIMATED_ROWS: i64 = 1_000_000;
+/// Planner fallback when a KNN plan's `k` is not known until execution. A top-k
+/// plan returns few rows either way, so this stays small rather than borrowing
+/// the full-scan estimate.
+const DEFAULT_KNN_ROWS: i64 = 10;
 
 const COL_EMBEDDING: c_int = 0;
 const COL_SCORE: c_int = 1;
@@ -48,6 +55,7 @@ const PLAN_ROWID_FILTER_IN: c_int = 0x100;
 // The IN callbacks were appended in SQLite 3.38; this project supports 3.44+.
 const API_LIBVERSION_NUMBER: usize = 67;
 const API_VTAB_CONFIG: usize = 177;
+const API_VTAB_RHS_VALUE: usize = 257;
 const API_VTAB_IN: usize = 259;
 const API_VTAB_IN_FIRST: usize = 260;
 const API_VTAB_IN_NEXT: usize = 261;
@@ -70,6 +78,11 @@ type IntegrityCallback = unsafe extern "C" fn(
 ) -> c_int;
 type VtabConfigCallback = unsafe extern "C" fn(*mut ffi::sqlite3, c_int, ...) -> c_int;
 type VtabInCallback = unsafe extern "C" fn(*mut ffi::sqlite3_index_info, c_int, c_int) -> c_int;
+type VtabRhsValueCallback = unsafe extern "C" fn(
+    *mut ffi::sqlite3_index_info,
+    c_int,
+    *mut *mut ffi::sqlite3_value,
+) -> c_int;
 type VtabInIterCallback =
     unsafe extern "C" fn(*mut ffi::sqlite3_value, *mut *mut ffi::sqlite3_value) -> c_int;
 
@@ -79,9 +92,21 @@ struct ModuleV4 {
     x_integrity: Option<IntegrityCallback>,
 }
 
+// `ModuleV4` only places xIntegrity where SQLite reads it while Rusqlite's
+// `sqlite3_module` still stops at xShadowName (the iVersion 3 layout): 1 padded
+// int plus 23 callback pointers. libsqlite3-sys arrives transitively, so a
+// minor bump could grow the struct and silently turn the appended field into
+// dead bytes — `PRAGMA integrity_check` would stop checking turbovec0 with no
+// diagnostic at all. Fail the build instead.
+const _: () = assert!(
+    std::mem::offset_of!(ModuleV4, x_integrity) == 24 * size_of::<usize>(),
+    "sqlite3_module layout changed; xIntegrity is no longer the 24th slot"
+);
+
 static ORIGINAL_BEST_INDEX: OnceLock<usize> = OnceLock::new();
 static ORIGINAL_FILTER: OnceLock<usize> = OnceLock::new();
 static VTAB_CONFIG: OnceLock<usize> = OnceLock::new();
+static VTAB_RHS_VALUE: OnceLock<usize> = OnceLock::new();
 static VTAB_IN: OnceLock<usize> = OnceLock::new();
 static VTAB_IN_FIRST: OnceLock<usize> = OnceLock::new();
 static VTAB_IN_NEXT: OnceLock<usize> = OnceLock::new();
@@ -108,6 +133,7 @@ pub(crate) unsafe fn initialize_api(api: *mut ffi::sqlite3_api_routines) {
     }
     for (slot, destination) in [
         (API_VTAB_CONFIG, &VTAB_CONFIG),
+        (API_VTAB_RHS_VALUE, &VTAB_RHS_VALUE),
         (API_VTAB_IN, &VTAB_IN),
         (API_VTAB_IN_FIRST, &VTAB_IN_FIRST),
         (API_VTAB_IN_NEXT, &VTAB_IN_NEXT),
@@ -227,6 +253,43 @@ fn vtab_in(info: *mut ffi::sqlite3_index_info, index: usize, mode: c_int) -> Res
     Ok(unsafe { callback(info, index as c_int, mode) } != 0)
 }
 
+/// The top-k a KNN plan will actually produce, when SQLite can tell us at plan
+/// time. A hidden `k=n` caps the search; otherwise LIMIT does. Both are often
+/// literals or already-bound values, and anything unavailable yields `None`
+/// rather than a guess.
+fn planned_k(k: Option<usize>, limit: Option<usize>) -> Option<i64> {
+    let value = |constraint: Option<usize>| -> Option<i64> {
+        rhs_integer(current_index_info().ok()?, constraint?)
+    };
+    match (value(k), value(limit)) {
+        (Some(k), Some(limit)) => Some(k.min(limit)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// A constraint's non-negative integer right-hand value, when SQLite knows it
+/// during planning. Planner-only, so every failure — an old host, a value not
+/// yet known, a non-integer — collapses to `None` instead of failing the
+/// statement.
+fn rhs_integer(info: *mut ffi::sqlite3_index_info, index: usize) -> Option<i64> {
+    let pointer = *VTAB_RHS_VALUE.get()?;
+    let callback: VtabRhsValueCallback = unsafe { std::mem::transmute(pointer) };
+    let mut value = ptr::null_mut();
+    if unsafe { callback(info, index as c_int, &mut value) } != ffi::SQLITE_OK || value.is_null() {
+        return None;
+    }
+    // SAFETY: SQLite owns this value and keeps it valid for the duration of the
+    // xBestIndex call this runs inside, which is the only place it is read.
+    let value = unsafe {
+        if ffi::sqlite3_value_type(value) != ffi::SQLITE_INTEGER {
+            return None;
+        }
+        ffi::sqlite3_value_int64(value)
+    };
+    (value >= 0).then_some(value)
+}
+
 fn append_in_values(list: *mut ffi::sqlite3_value, ids: &mut Vec<u64>) -> Result<()> {
     let first_pointer = *VTAB_IN_FIRST
         .get()
@@ -270,6 +333,16 @@ unsafe extern "C" fn shadow_name(name: *const c_char) -> c_int {
 }
 
 unsafe fn set_vtab_error(table: *mut ffi::sqlite3_vtab, message: &str) -> c_int {
+    // Most callbacks reach SQLite through sqlite3VtabImportErrmsg(), which
+    // frees and clears zErrMsg for us. sqlite3VtabSavepoint() does not: it
+    // returns the code and never looks at the message, so a failing
+    // xSavepoint/xRelease/xRollbackTo leaves this allocation owned by nobody.
+    // Release whatever is there before overwriting the pointer, otherwise the
+    // second failure on one table leaks the first message too.
+    unsafe {
+        ffi::sqlite3_free((*table).zErrMsg.cast());
+        (*table).zErrMsg = ptr::null_mut();
+    }
     let length = message.len().saturating_add(1);
     let allocation = unsafe { ffi::sqlite3_malloc64(length as u64) }.cast::<u8>();
     if allocation.is_null() {
@@ -380,11 +453,9 @@ fn parse_geometry(args: &[&[u8]]) -> Result<(usize, usize)> {
 }
 
 fn names(database: &[u8], table: &[u8]) -> Result<(String, String)> {
-    let database = std::str::from_utf8(database)?;
-    let table = std::str::from_utf8(table)?;
-    Ok((
-        format!("{}.{}", quote(database), quote(&format!("{table}_meta"))),
-        format!("{}.{}", quote(database), quote(&format!("{table}_chunks"))),
+    Ok(names_str(
+        std::str::from_utf8(database)?,
+        std::str::from_utf8(table)?,
     ))
 }
 
@@ -409,7 +480,18 @@ fn read_generation(connection: &Connection, meta: &str) -> Result<i64> {
     )
 }
 
-fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i64, Vec<u8>, bool)> {
+/// Validate the stored geometry and report what the base image should contain.
+/// Returns the generation, the declared byte length, the chunk count, and
+/// whether delta batches are expected.
+///
+/// This runs before anything reads chunk contents: SQLite can report BLOB
+/// lengths without loading them into Rust buffers, so impossible metadata is
+/// rejected without ever sizing an allocation from it.
+fn validate_chunks(
+    connection: &Connection,
+    meta: &str,
+    chunks: &str,
+) -> Result<(i64, usize, i64, bool)> {
     let (generation, stored_len): (i64, i64) = connection.query_row(
         &format!("SELECT generation, byte_len FROM {meta} WHERE id=1"),
         [],
@@ -426,8 +508,6 @@ fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i6
     };
     let expected_len = usize::try_from(expected_len)
         .map_err(|_| error("negative or oversized persisted TurboVec byte length"))?;
-    // Check storage geometry before allocating from untrusted metadata. SQLite
-    // can read BLOB lengths without loading their contents into Rust buffers.
     let mut statement = connection.prepare(&format!(
         "SELECT chunk_id, length(data), typeof(data) FROM {chunks} \
          WHERE chunk_id>=0 ORDER BY chunk_id"
@@ -460,33 +540,96 @@ fn read_payload(connection: &Connection, meta: &str, chunks: &str) -> Result<(i6
             "TurboVec chunks contain {actual_len} bytes; metadata declares {expected_len}"
         )));
     }
+    Ok((generation, expected_len, count, has_deltas))
+}
 
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(actual_len)
-        .map_err(|_| sqlite_error(ffi::SQLITE_NOMEM, "cannot allocate TurboVec chunk payload"))?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT chunk_id, data FROM {chunks} WHERE chunk_id>=0 ORDER BY chunk_id"
-    ))?;
-    let mut rows = statement.query([])?;
-    let mut chunk_id = 0_i64;
-    while let Some(row) = rows.next()? {
-        let stored_id: i64 = row.get(0)?;
-        let piece = row.get_ref(1)?.as_blob()?;
-        let remaining = expected_len - payload.len();
-        if stored_id != chunk_id || piece.len() != remaining.min(CHUNK_SIZE) || piece.is_empty() {
+/// The committed base image as one byte stream, read a chunk at a time through
+/// incremental BLOB I/O.
+///
+/// This exists so that opening an index holds one full copy of the image
+/// instead of two. `IdMapIndex::from_bytes` copies the slice it is handed into
+/// an owned buffer of its own, so materializing the chunks into a `Vec` first
+/// doubled the peak: measured 104 MB of growth on a 48.5 MB image. Streaming
+/// straight into the loader leaves only the loader's buffer.
+struct ChunkReader<'a> {
+    blob: Blob<'a>,
+    chunk_id: i64,
+    chunk_count: i64,
+    remaining: usize,
+}
+
+impl<'a> ChunkReader<'a> {
+    fn open(
+        connection: &'a Connection,
+        database: &str,
+        chunks_table: &str,
+        chunk_count: i64,
+        expected_len: usize,
+    ) -> Result<Self> {
+        if chunk_count == 0 {
+            return Err(error(
+                "cannot open turbovec0 index: TurboVec index is too short to contain a format header",
+            ));
+        }
+        let blob = connection.blob_open(database, chunks_table, "data", 0, true)?;
+        let mut reader = Self {
+            blob,
+            chunk_id: 0,
+            chunk_count,
+            remaining: expected_len,
+        };
+        reader.check_chunk_len()?;
+        Ok(reader)
+    }
+
+    /// The format gate has to run before any bytes reach TurboVec's loader, so
+    /// read the header off the first chunk and rewind. `reopen` resets the read
+    /// position, which makes the rewind free.
+    fn check_format(&mut self) -> Result<()> {
+        let mut header = [0_u8; 5];
+        self.blob.read_exact(&mut header).map_err(|_| {
+            error("cannot open turbovec0 index: TurboVec index is too short to contain a format header")
+        })?;
+        check_format(&header)
+            .map_err(|cause| error(format!("cannot open turbovec0 index: {cause}")))?;
+        self.blob.reopen(0)?;
+        Ok(())
+    }
+
+    /// Chunk lengths were validated before this reader opened. Re-check each
+    /// one as it is reached so a concurrent rewrite is reported rather than
+    /// silently deserialized, which is what the old second pass did.
+    fn check_chunk_len(&mut self) -> Result<()> {
+        if self.blob.len() != self.remaining.min(CHUNK_SIZE) {
             return Err(error("TurboVec chunks changed while reading their payload"));
         }
-        payload.extend_from_slice(piece);
-        chunk_id += 1;
+        Ok(())
     }
-    if payload.len() != expected_len {
-        return Err(error(format!(
-            "TurboVec chunks contain {} bytes; metadata declares {expected_len}",
-            payload.len()
-        )));
+}
+
+impl Read for ChunkReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // An empty destination must not be mistaken for end-of-chunk, or it
+        // would skip a chunk without reading it.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let read = self.blob.read(buf)?;
+            if read != 0 {
+                self.remaining = self.remaining.checked_sub(read).ok_or_else(|| {
+                    io::Error::other("TurboVec chunks changed while reading their payload")
+                })?;
+                return Ok(read);
+            }
+            self.chunk_id += 1;
+            if self.chunk_id >= self.chunk_count {
+                return Ok(0);
+            }
+            self.blob.reopen(self.chunk_id).map_err(io::Error::other)?;
+            self.check_chunk_len().map_err(io::Error::other)?;
+        }
     }
-    Ok((generation, payload, has_deltas))
 }
 
 struct LoadedIndex {
@@ -621,12 +764,27 @@ fn delta_encoded_len(changes: &[Change], dimensions: usize) -> Result<usize> {
         .ok_or_else(|| sqlite_error(ffi::SQLITE_TOOBIG, "turbovec0 delta is too large"))
 }
 
-fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<LoadedIndex> {
-    let (generation, payload, expects_deltas) = read_payload(connection, meta, chunks)?;
-    check_format(&payload)
-        .map_err(|cause| error(format!("cannot open turbovec0 index: {cause}")))?;
-    let mut index = IdMapIndex::from_bytes(&payload)
+fn read_index(
+    connection: &Connection,
+    database: &str,
+    meta: &str,
+    chunks: &str,
+    chunks_table: &str,
+) -> Result<LoadedIndex> {
+    let (generation, base_bytes, chunk_count, expects_deltas) =
+        validate_chunks(connection, meta, chunks)?;
+    let mut reader =
+        ChunkReader::open(connection, database, chunks_table, chunk_count, base_bytes)?;
+    reader.check_format()?;
+    let mut index = IdMapIndex::load_from_reader(&mut reader)
         .map_err(|cause| error(format!("invalid chunked TurboVec index: {cause}")))?;
+    if reader.remaining != 0 {
+        return Err(error(format!(
+            "TurboVec chunks contain {} unread bytes; metadata declares {base_bytes}",
+            reader.remaining
+        )));
+    }
+    drop(reader);
     let dimensions = index
         .dim_opt()
         .ok_or_else(|| error("persisted turbovec0 index has no dimensions"))?;
@@ -678,7 +836,7 @@ fn read_index(connection: &Connection, meta: &str, chunks: &str) -> Result<Loade
     Ok(LoadedIndex {
         generation,
         index,
-        base_bytes: payload.len(),
+        base_bytes,
         delta_bytes,
         delta_operations,
     })
@@ -716,7 +874,8 @@ pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Resu
     }
 
     let (meta, chunks) = names_str(database, table);
-    let loaded = read_index(connection, &meta, &chunks)?;
+    let chunks_table = format!("{table}_chunks");
+    let loaded = read_index(connection, database, &meta, &chunks, &chunks_table)?;
     Ok(serde_json::json!({
         "table": qualified_table,
         "generation": loaded.generation,
@@ -1095,7 +1254,7 @@ impl TurboVecTable {
                     stored.0, stored.1
                 )));
             }
-            let loaded = read_index(&connection, &meta, &chunks)?;
+            let loaded = read_index(&connection, &database, &meta, &chunks, &chunks_table)?;
             validate_geometry(&loaded.index, dimensions, bit_width)?;
             loaded
         };
@@ -1127,16 +1286,107 @@ impl TurboVecTable {
         }
         let connection = connection(self.db)?;
         let persisted_generation = read_generation(&connection, &self.meta)?;
-        if state.needs_reload || persisted_generation != state.generation {
-            let loaded = read_index(&connection, &self.meta, &self.chunks)?;
-            state.generation = loaded.generation;
-            state.index = loaded.index;
-            state.base_bytes = loaded.base_bytes;
-            state.delta_bytes = loaded.delta_bytes;
-            state.delta_operations = loaded.delta_operations;
-            state.needs_reload = false;
+        if !state.needs_reload && persisted_generation == state.generation {
+            return Ok(state);
         }
+        if !state.needs_reload && self.catch_up(&connection, state, persisted_generation)? {
+            return Ok(state);
+        }
+        let loaded = read_index(
+            &connection,
+            &self.database,
+            &self.meta,
+            &self.chunks,
+            &self.chunks_table,
+        )?;
+        state.generation = loaded.generation;
+        state.index = loaded.index;
+        state.base_bytes = loaded.base_bytes;
+        state.delta_bytes = loaded.delta_bytes;
+        state.delta_operations = loaded.delta_operations;
+        state.needs_reload = false;
         Ok(state)
+    }
+
+    /// Bring a warm copy forward by replaying only the delta batches other
+    /// connections committed since its generation, instead of rebuilding the
+    /// whole index. This is the difference between a read after a concurrent
+    /// one-row commit costing O(index) and costing O(that commit).
+    ///
+    /// The base image is provably unchanged whenever the oldest surviving
+    /// delta is no newer than this copy's generation: compaction rewrites the
+    /// base and deletes every delta in the same statement, so a delta older
+    /// than us could not have survived one. Everything else — a compaction, a
+    /// gap in the chain, a generation that does not land exactly on the
+    /// persisted one — returns `false` and lets the caller do the full read,
+    /// which is also the only path that can correct `base_bytes`.
+    fn catch_up(
+        &self,
+        connection: &Connection,
+        state: &mut State,
+        persisted_generation: i64,
+    ) -> Result<bool> {
+        if persisted_generation <= state.generation {
+            return Ok(false);
+        }
+        // Deltas live at chunk_id = -generation, so the greatest negative
+        // chunk_id is the oldest surviving batch.
+        let oldest: Option<i64> = connection.query_row(
+            &format!("SELECT max(chunk_id) FROM {} WHERE chunk_id<0", self.chunks),
+            [],
+            |row| row.get(0),
+        )?;
+        let Some(oldest) = oldest.and_then(|chunk_id| chunk_id.checked_neg()) else {
+            return Ok(false);
+        };
+        if oldest > state.generation {
+            return Ok(false);
+        }
+        let mut statement = connection.prepare(&format!(
+            "SELECT chunk_id, data, typeof(data) FROM {} \
+             WHERE chunk_id<0 AND chunk_id<?1 ORDER BY chunk_id DESC",
+            self.chunks
+        ))?;
+        let mut rows = statement.query([-state.generation])?;
+        // Replay applies to the live warm copy, so a failure or a declined
+        // chain part-way through leaves it between generations. Arm the
+        // full-reload flag across the whole walk and clear it only after a
+        // complete, contiguous catch-up.
+        state.needs_reload = true;
+        let mut generation = state.generation;
+        let mut delta_bytes = state.delta_bytes;
+        let mut delta_operations = state.delta_operations;
+        while let Some(row) = rows.next()? {
+            let chunk_id: i64 = row.get(0)?;
+            let kind: String = row.get(2)?;
+            if kind != "blob" {
+                return Err(error("invalid turbovec0 delta storage type"));
+            }
+            let delta_generation = chunk_id
+                .checked_neg()
+                .ok_or_else(|| error("invalid turbovec0 delta generation"))?;
+            if delta_generation != generation + 1 {
+                return Ok(false);
+            }
+            let blob = row.get_ref(1)?.as_blob()?;
+            let changes = decode_delta(blob, self.dimensions)?;
+            Self::replay(&mut state.index, &changes)?;
+            delta_bytes = delta_bytes
+                .checked_add(blob.len())
+                .ok_or_else(|| error("oversized turbovec0 delta storage"))?;
+            delta_operations = delta_operations
+                .checked_add(changes.len())
+                .ok_or_else(|| error("too many turbovec0 delta operations"))?;
+            generation = delta_generation;
+        }
+        if generation != persisted_generation {
+            return Ok(false);
+        }
+        state.generation = generation;
+        state.delta_bytes = delta_bytes;
+        state.delta_operations = delta_operations;
+        state.needs_reload = false;
+        Ok(true)
     }
 
     fn rename(&mut self, new_name: &str) -> Result<()> {
@@ -1157,7 +1407,13 @@ impl TurboVecTable {
 
     fn integrity(&self) -> Result<()> {
         let connection = connection(self.db)?;
-        let loaded = read_index(&connection, &self.meta, &self.chunks)?;
+        let loaded = read_index(
+            &connection,
+            &self.database,
+            &self.meta,
+            &self.chunks,
+            &self.chunks_table,
+        )?;
         let (dimensions, bit_width): (i64, i64) = connection.query_row(
             &format!("SELECT dimensions, bit_width FROM {} WHERE id=1", self.meta),
             [],
@@ -1294,7 +1550,13 @@ impl TurboVecTable {
                     return Err(error("cannot roll back a turbovec0 savepoint after xSync"));
                 }
                 let connection = connection(self.db)?;
-                let loaded = read_index(&connection, &self.meta, &self.chunks)?;
+                let loaded = read_index(
+                    &connection,
+                    &self.database,
+                    &self.meta,
+                    &self.chunks,
+                    &self.chunks_table,
+                )?;
                 if loaded.generation != transaction.start_generation {
                     state.transaction = Some(transaction);
                     return Err(error("turbovec0 changed while restoring a savepoint"));
@@ -1308,6 +1570,15 @@ impl TurboVecTable {
         state.dirty = !transaction.changes.is_empty();
         state.transaction = Some(transaction);
         Ok(())
+    }
+
+    /// Row count for planner estimates. `try_lock` keeps xBestIndex off the
+    /// blocking path: a cursor or a writer may hold the state lock, and a
+    /// stalled planner is worse than a stale row count.
+    fn warm_len(&self) -> i64 {
+        self.state
+            .try_lock()
+            .map_or(DEFAULT_ESTIMATED_ROWS, |state| state.index.len() as i64)
     }
 
     fn savepoint(&mut self, id: c_int) -> Result<()> {
@@ -1485,16 +1756,24 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
             } else {
                 "knn"
             });
-            info.set_estimated_cost(
-                self.state
-                    .lock()
-                    .map_or(1_000_000.0, |s| s.index.len() as f64),
-            );
-            info.set_estimated_rows(10);
+            // One KNN call scores every eligible row, so its cost really is
+            // proportional to the index. Row count is not: it is the top-k the
+            // caller asked for. Reporting a full scan's worth of rows made the
+            // planner size joins around this table as if it returned millions.
+            let rows = self.warm_len();
+            info.set_estimated_cost(rows as f64);
+            info.set_estimated_rows(planned_k(k, limit).map_or(DEFAULT_KNN_ROWS, |k| k.min(rows)));
         } else if unusable_query {
-            return Err(error(
-                "turbovec0 MATCH query is not constant for this scan; use a bound value or scalar subquery",
-            ));
+            // Decline this plan rather than failing the statement. SQLite
+            // explores join orders in turn and offers the MATCH as unusable in
+            // the ones where the query vector is not yet in scope; an error
+            // here killed statements whose *other* orders were perfectly
+            // serviceable, which is what blocked `q JOIN v ON v.embedding
+            // MATCH q.embedding AND v.k=n`. Returning false lets SQLite try
+            // the order that works. When no order works it reports "no query
+            // solution" instead of the tailored message, which is the whole
+            // cost of this.
+            return Ok(false);
         } else if let Some(rowid) = rowid {
             let mut usage = info.constraint_usage(rowid);
             usage.set_argv_index(1);
@@ -1505,10 +1784,7 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
             info.set_estimated_rows(1);
         } else {
             info.set_idx_num(PLAN_FULL_SCAN);
-            let rows = self
-                .state
-                .lock()
-                .map_or(1_000_000, |s| s.index.len() as i64);
+            let rows = self.warm_len();
             info.set_estimated_cost(rows as f64);
             info.set_estimated_rows(rows);
         }
@@ -1735,7 +2011,16 @@ impl TransactionVTab<'_> for TurboVecTable {
             .delta_operations
             .checked_add(pending.len())
             .ok_or_else(|| error("too many turbovec0 delta operations"))?;
-        let byte_limit = (state.base_bytes / 4).max(MIN_COMPACTION_DELTA_BYTES);
+        // The 16 MiB floor keeps small commits cheap on a large index, but it
+        // must never exceed the base image itself. A high-dimensional index
+        // carries a fixed rotation and codebook cost — an *empty* 1,536-dim
+        // table already serializes to 1.67 MiB — so the floor alone let a few
+        // thousand rows sit as raw f32 deltas several times larger than the
+        // 4-bit base they describe, and every cold open replayed them. Capping
+        // the budget at the base keeps deltas from outgrowing what they defer.
+        let byte_limit = (state.base_bytes / 4)
+            .max(MIN_COMPACTION_DELTA_BYTES)
+            .min(state.base_bytes.max(MIN_DELTA_BASE_BYTES));
         let operation_limit = (state.index.len() / 4).max(10_000);
         let compact = state.base_bytes < MIN_DELTA_BASE_BYTES
             || next_delta_bytes >= byte_limit
