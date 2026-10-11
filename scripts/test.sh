@@ -82,6 +82,10 @@ then
   done
   python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/storage.py "$extension"
+  # LEGACY_EXTENSION may name a 0.2.0 build; without it the upgrade test
+  # simulates 0.2.0 storage and cannot check that 0.2.0 refuses the result.
+  python3 -X faulthandler tests/lazy_index.py "$extension" \
+    ${LEGACY_EXTENSION:+--legacy-extension "$LEGACY_EXTENSION"}
   # 20 seeds of 20 steps missed a lost-replacement rollback that 300 of 30
   # reproduce in about a second.
   python3 -X faulthandler tests/model_check.py "$extension" --seeds 300 --steps 30
@@ -152,7 +156,7 @@ cp "$database" "$format_database"
   "update renamed_vectors_chunks
      set data=cast(substr(data, 1, 4) || x'03' || substr(data, 6) as blob)
    where chunk_id=0;
-   update renamed_vectors_meta set generation=generation+1;"
+   update renamed_vectors_info set generation=generation+1;"
 format_error=$(
   "$sqlite_bin" "$format_database" \
     -cmd ".load $extension" \

@@ -66,7 +66,7 @@ insert into document_vectors(rowid, embedding)
 select id, embedding from documents;
 
 insert into assertions values ((select count(*) from document_vectors) = 3);
-insert into assertions values ((select generation from document_vectors_meta) = 1);
+insert into assertions values ((select generation from document_vectors_info) = 1);
 insert into assertions
 select json_extract(info, '$.table') = 'document_vectors'
    and json_extract(info, '$.generation') = 1
@@ -78,9 +78,9 @@ select json_extract(info, '$.table') = 'document_vectors'
    and json_extract(info, '$.format_revision') = 2
 from (select turbovec_info('document_vectors') as info);
 insert into assertions
-select count(*) = 2
+select count(*) = 3
 from pragma_table_list
-where name in ('document_vectors_meta', 'document_vectors_chunks')
+where name in ('document_vectors_info', 'document_vectors_ids', 'document_vectors_chunks')
   and type = 'shadow';
 
 insert into assertions
@@ -109,7 +109,7 @@ values (4, '[-1, 0, 0, 0, 0, 0, 0, 0]');
 insert into assertions values ((select count(*) from document_vectors) = 4);
 rollback;
 insert into assertions values ((select count(*) from document_vectors) = 3);
-insert into assertions values ((select generation from document_vectors_meta) = 1);
+insert into assertions values ((select generation from document_vectors_info) = 1);
 
 begin immediate;
 insert into document_vectors(rowid, embedding)
@@ -121,11 +121,11 @@ rollback to after_four;
 release after_four;
 commit;
 insert into assertions values ((select count(*) from document_vectors) = 4);
-insert into assertions values ((select generation from document_vectors_meta) = 2);
+insert into assertions values ((select generation from document_vectors_info) = 2);
 
 delete from document_vectors where rowid = 2;
 insert into assertions values ((select count(*) from document_vectors) = 3);
-insert into assertions values ((select generation from document_vectors_meta) = 3);
+insert into assertions values ((select generation from document_vectors_info) = 3);
 
 insert or ignore into document_vectors(rowid, embedding)
 values (1, '[0, 1, 0, 0, 0, 0, 0, 0]');
@@ -146,9 +146,9 @@ order by score desc;
 alter table document_vectors rename to renamed_vectors;
 insert into assertions values ((select count(*) from renamed_vectors) = 3);
 insert into assertions
-select count(*) = 2
+select count(*) = 3
 from pragma_table_list
-where name in ('renamed_vectors_meta', 'renamed_vectors_chunks')
+where name in ('renamed_vectors_info', 'renamed_vectors_ids', 'renamed_vectors_chunks')
   and type = 'shadow';
 insert into assertions
 select integrity_check = 'ok' from pragma_integrity_check;
@@ -158,7 +158,7 @@ drop table disposable_vectors;
 insert into assertions
 select count(*) = 0
 from pragma_table_list
-where name in ('disposable_vectors_meta', 'disposable_vectors_chunks');
+where name like 'disposable_vectors%';
 
 begin immediate;
 update vector_indexes

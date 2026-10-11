@@ -257,7 +257,7 @@ def main() -> None:
     ):
         connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
         try:
-            connection.execute("update v_meta set generation=99")
+            connection.execute("update v_info set generation=99")
         except sqlite3.DatabaseError:
             pass
         else:

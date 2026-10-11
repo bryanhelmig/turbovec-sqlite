@@ -54,7 +54,7 @@ def payload(db: sqlite3.Connection) -> bytes:
     assert all(len(row[1]) == CHUNK_SIZE for row in chunks[:-1])
     assert 0 < len(chunks[-1][1]) <= CHUNK_SIZE
     data = b"".join(row[1] for row in chunks)
-    stored_len = db.execute("select byte_len from v_meta").fetchone()[0]
+    stored_len = db.execute("select byte_len from v_info").fetchone()[0]
     expected_len = -stored_len - 1 if stored_len < 0 else stored_len
     assert len(data) == expected_len
     return data
@@ -123,9 +123,9 @@ def corruption_worker(extension: Path, database: Path, query: str) -> None:
 
 def corruption_regression(extension: Path) -> None:
     cases = {
-        "huge": "update v_meta set byte_len=9223372036854775807",
-        "negative": "update v_meta set byte_len=-1",
-        "wrong_length": "update v_meta set byte_len=byte_len+1",
+        "huge": "update v_info set byte_len=9223372036854775807",
+        "negative": "update v_info set byte_len=-1",
+        "wrong_length": "update v_info set byte_len=byte_len+1",
         "missing_chunk": "delete from v_chunks",
         "wrong_id": "update v_chunks set chunk_id=3",
         "empty_chunk": "update v_chunks set data=x''",
