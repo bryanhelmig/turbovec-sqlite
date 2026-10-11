@@ -1520,7 +1520,13 @@ impl TurboVecTable {
 
     fn undo_insert_prefix(index: &mut IdMapIndex, changes: &[Change]) -> Result<()> {
         for change in changes.iter().rev() {
-            let Change::Insert { id, .. } = change else {
+            // Removing a replacement would lose the row it replaced.
+            let Change::Insert {
+                id,
+                replaces: false,
+                ..
+            } = change
+            else {
                 return Err(error(
                     "turbovec0 transaction prefix contains a destructive change",
                 ));
@@ -1913,14 +1919,19 @@ impl UpdateVTab<'_> for TurboVecTable {
             .index
             .add_with_ids(&vector, &[id])
             .map_err(|cause| error(format!("cannot insert vector: {cause}")))?;
+        // After the first delete or replacement every insert keeps its
+        // vector. Vector-less inserts then all precede the destructive
+        // checkpoint, so a rollback past it only has appends to undo.
         let retain_vector = state.base_bytes >= MIN_DELTA_BASE_BYTES
             || exists
             || state.transaction.as_ref().is_some_and(|transaction| {
                 transaction.destructive_checkpoint.is_some()
-                    || transaction
-                        .changes
-                        .iter()
-                        .any(|change| matches!(change, Change::Delete { .. }))
+                    || transaction.changes.iter().any(|change| {
+                        matches!(
+                            change,
+                            Change::Delete { .. } | Change::Insert { replaces: true, .. }
+                        )
+                    })
             });
         let transaction = state
             .transaction
