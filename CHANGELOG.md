@@ -25,6 +25,11 @@
   vectors after any delete or replacement. 0.2.0 has this bug. The test script now
   runs the transaction model check for 300 seeds of 30 steps, which reproduces
   it; the previous 20 seeds of 20 did not.
+- Pin the extension on Windows so it stays loaded after its last connection
+  closes. SQLite unloads it then, but every search starts TurboVec's rayon
+  worker threads, which keep running code from the library and fault once
+  Windows unmaps it. Linux and macOS already keep it loaded. 0.2.0 has this
+  too; a test now checks that the library outlives its connections.
 - `PRAGMA integrity_check` compares `_ids` and the `_info` counts with the
   index. A load checks the index's row count against `_info`.
 - Each insert and delete writes one `_ids` row, which `total_changes()` counts.
