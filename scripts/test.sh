@@ -69,6 +69,7 @@ supported = (
 raise SystemExit(not supported)
 PY
 then
+  python3 -X faulthandler tests/unload.py "$extension"
   python3 -X faulthandler tests/multiconnection.py \
     "$test_dir/multiconnection.db" \
     "$extension"
