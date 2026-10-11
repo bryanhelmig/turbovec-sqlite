@@ -1347,8 +1347,8 @@ struct State {
     layout: Layout,
     /// Generation of the committed storage this state describes.
     generation: i64,
-    /// The warm index, or `None` when the next use must reload it. When
-    /// loaded it includes this transaction's changes.
+    /// The warm index, or `None` until a search, a compaction, or a legacy
+    /// layout needs it. When loaded it includes this transaction's changes.
     index: Option<IdMapIndex>,
     transaction: Option<TransactionState>,
     dirty: bool,
@@ -1500,7 +1500,8 @@ fn open_storage(
         )));
     }
     if layout == Layout::Current {
-        // The first use loads the index.
+        // Connecting reads one row. The index loads when a search or a
+        // compaction first needs it.
         let info = read_info(connection, &names.info)?;
         return Ok(State {
             layout,
@@ -1665,7 +1666,6 @@ impl TurboVecTable {
         state.delta_bytes = info.delta_bytes;
         state.delta_operations = info.delta_operations;
         state.row_count = info.row_count;
-        self.ensure_loaded(state)?;
         Ok(())
     }
 
@@ -1799,6 +1799,16 @@ impl TurboVecTable {
         Ok(state.index.as_mut().expect("index loaded above"))
     }
 
+    /// Load the index when a write cannot go without it: a legacy index has
+    /// no `_ids` to check rowids against, and every commit rewrites a base
+    /// under 1 MiB anyway.
+    fn prepare_write(&self, state: &mut State) -> Result<()> {
+        if state.layout == Layout::Legacy || state.base_bytes < MIN_DELTA_BASE_BYTES {
+            self.ensure_loaded(state)?;
+        }
+        Ok(())
+    }
+
     /// Give a 0.2.0-layout index `_info` and `_ids`, and empty `_meta`. Every
     /// 0.2.0 code path reads the `_meta` row first, so older builds refuse
     /// the index from then on instead of writing without maintaining `_ids`.
@@ -1875,6 +1885,18 @@ impl TurboVecTable {
         Ok(removed == 1)
     }
 
+    fn has_id(&self, id: u64) -> Result<bool> {
+        let connection = connection(self.db)?;
+        connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {} WHERE id=?1)",
+                self.names.ids
+            ),
+            [sql_id(id)?],
+            |row| row.get(0),
+        )
+    }
+
     fn stored_ids(&self) -> Result<Vec<u64>> {
         let connection = connection(self.db)?;
         let mut statement =
@@ -1883,6 +1905,28 @@ impl TurboVecTable {
             .query_map([], |row| row.get::<_, i64>(0))?
             .map(|id| u64::try_from(id?).map_err(|_| error("negative rowid in turbovec0 _ids")))
             .collect()
+    }
+
+    /// Every rowid, from the warm index when it is loaded and from `_ids`
+    /// otherwise.
+    fn rowids(&self, state: &mut State) -> Result<Vec<u64>> {
+        if state.layout == Layout::Legacy {
+            self.ensure_loaded(state)?;
+        }
+        match state.index.as_ref() {
+            Some(index) => Ok(index.iter_ids().collect()),
+            None => self.stored_ids(),
+        }
+    }
+
+    fn contains_rowid(&self, state: &mut State, id: u64) -> Result<bool> {
+        if state.layout == Layout::Legacy {
+            self.ensure_loaded(state)?;
+        }
+        match state.index.as_ref() {
+            Some(index) => Ok(index.contains(id)),
+            None => self.has_id(id),
+        }
     }
 
     fn ids_disagree(&self, id: u64) -> Error {
@@ -2407,16 +2451,29 @@ impl UpdateVTab<'_> for TurboVecTable {
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
         let state = &mut *guard;
         self.refresh(state)?;
-        let present = self.ensure_loaded(state)?.contains(id);
-        if state.layout == Layout::Current && self.remove_id(id)? != present {
-            return Err(self.ids_disagree(id));
-        }
+        self.prepare_write(state)?;
+        let present = match state.layout {
+            Layout::Legacy => state.index.as_ref().is_some_and(|index| index.contains(id)),
+            Layout::Current => {
+                let removed = self.remove_id(id)?;
+                if state
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| index.contains(id) != removed)
+                {
+                    return Err(self.ids_disagree(id));
+                }
+                removed
+            }
+        };
         if !present {
             return Err(error(format!("unknown turbovec0 rowid {id}")));
         }
-        Self::ensure_destructive_checkpoint(state);
-        if !state.index.as_mut().is_some_and(|index| index.remove(id)) {
-            return Err(error(format!("unknown turbovec0 rowid {id}")));
+        if state.index.is_some() {
+            Self::ensure_destructive_checkpoint(state);
+            if !state.index.as_mut().is_some_and(|index| index.remove(id)) {
+                return Err(error(format!("unknown turbovec0 rowid {id}")));
+            }
         }
         Self::ensure_transaction(state)
             .changes
@@ -2445,44 +2502,61 @@ impl UpdateVTab<'_> for TurboVecTable {
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
         let state = &mut *guard;
         self.refresh(state)?;
-        let exists = self.ensure_loaded(state)?.contains(id);
-        // Writes nothing when the rowid exists, so a refused insert leaves
-        // `_ids` as it was.
-        if state.layout == Layout::Current && self.add_id(id)? == exists {
-            return Err(self.ids_disagree(id));
-        }
+        self.prepare_write(state)?;
+        let exists = match state.layout {
+            Layout::Legacy => state.index.as_ref().is_some_and(|index| index.contains(id)),
+            Layout::Current => {
+                // Writes nothing when the rowid exists, so a refused insert
+                // leaves `_ids` as it was.
+                let exists = !self.add_id(id)?;
+                if state
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| index.contains(id) != exists)
+                {
+                    return Err(self.ids_disagree(id));
+                }
+                exists
+            }
+        };
         if exists && conflict != ConflictMode::Replace {
             return Err(sqlite_error(
                 ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
                 format!("turbovec0 rowid {id} already exists"),
             ));
         }
-        if exists {
-            Self::ensure_destructive_checkpoint(state);
+        let retain_vector = if state.index.is_some() {
+            if exists {
+                Self::ensure_destructive_checkpoint(state);
+            } else {
+                Self::ensure_transaction(state);
+            }
+            let index = state.index.as_mut().expect("checked above");
+            if exists {
+                index.remove(id);
+            }
+            index
+                .add_with_ids(&vector, &[id])
+                .map_err(|cause| error(format!("cannot insert vector: {cause}")))?;
+            // After the first delete or replacement every insert keeps its
+            // vector. Vector-less inserts then all precede the destructive
+            // checkpoint, so a rollback past it only has appends to undo.
+            state.base_bytes >= MIN_DELTA_BASE_BYTES
+                || exists
+                || state.transaction.as_ref().is_some_and(|transaction| {
+                    transaction.destructive_checkpoint.is_some()
+                        || transaction.changes.iter().any(|change| {
+                            matches!(
+                                change,
+                                Change::Delete { .. } | Change::Insert { replaces: true, .. }
+                            )
+                        })
+                })
         } else {
-            Self::ensure_transaction(state);
-        }
-        let index = state.index.as_mut().expect("index loaded above");
-        if exists {
-            index.remove(id);
-        }
-        index
-            .add_with_ids(&vector, &[id])
-            .map_err(|cause| error(format!("cannot insert vector: {cause}")))?;
-        // After the first delete or replacement every insert keeps its
-        // vector. Vector-less inserts then all precede the destructive
-        // checkpoint, so a rollback past it only has appends to undo.
-        let retain_vector = state.base_bytes >= MIN_DELTA_BASE_BYTES
-            || exists
-            || state.transaction.as_ref().is_some_and(|transaction| {
-                transaction.destructive_checkpoint.is_some()
-                    || transaction.changes.iter().any(|change| {
-                        matches!(
-                            change,
-                            Change::Delete { .. } | Change::Insert { replaces: true, .. }
-                        )
-                    })
-            });
+            // The commit's delta needs the vector, and so does any later
+            // load that replays this transaction onto the index.
+            true
+        };
         Self::ensure_transaction(state)
             .changes
             .push(Change::Insert {
@@ -2729,14 +2803,14 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
 
         let rows = match plan & PLAN_KIND_MASK {
             PLAN_FULL_SCAN => table
-                .ensure_loaded(&mut state)?
-                .iter_ids()
+                .rowids(&mut state)?
+                .into_iter()
                 .map(|id| (id, None))
                 .collect(),
             PLAN_ROWID => {
                 let rowid: i64 = args.get(0)?;
                 if let Ok(id) = u64::try_from(rowid)
-                    && table.ensure_loaded(&mut state)?.contains(id)
+                    && table.contains_rowid(&mut state, id)?
                 {
                     vec![(id, None)]
                 } else {
