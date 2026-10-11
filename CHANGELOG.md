@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- Commit inserts and deletes without loading the compressed index. A new
+  `<name>_ids` shadow table answers rowid conflict checks, rowid lookups, full
+  rowid scans, and `count(*)`; a new `<name>_info` row holds the row count and
+  delta counts a commit needs. Connecting reads that one row. The index loads on
+  the first search, or when a commit compacts. On a 1,000,000-row,
+  1,536-dimensional index (745 MiB base), a one-row delete-and-insert commit
+  from a fresh process fell from 468 ms and 830 MiB peak RSS to 0.8 ms and
+  24.5 MiB, with a warm page cache. The first search costs what it did.
+- Upgrade 0.2.0 storage in place on its first write: the commit creates `_info`
+  and `_ids` from the index it already loaded and empties `<name>_meta`. This
+  took 1.1 s on the index above. Reads alone do not upgrade. The upgrade is
+  one-way: 0.2.0 then refuses the index with "Query returned no rows", including
+  a connection opened before the upgrade, so it cannot write without
+  maintaining `_ids`. Chunk and delta formats are unchanged.
+- Record a storage format number in `_info` and refuse an unknown one by
+  number.
+- Fix a savepoint rollback that lost a replaced row. On a base under 1 MiB, an
+  insert after an `INSERT OR REPLACE` dropped its vector, so a later delete took
+  its destructive checkpoint after the replacement, and rolling back past the
+  checkpoint undid the replacement by removing the row. Inserts now keep their
+  vectors after any delete or replacement. 0.2.0 has this bug. The test script now
+  runs the transaction model check for 300 seeds of 30 steps, which reproduces
+  it; the previous 20 seeds of 20 did not.
+- `PRAGMA integrity_check` compares `_ids` and the `_info` counts with the
+  index. A load checks the index's row count against `_info`.
+- Each insert and delete writes one `_ids` row, which `total_changes()` counts.
+  A 100,000-row bulk insert in one transaction took 11% longer (1.29 s to
+  1.43 s).
+
 ## 0.2.0 — 2026-09-26
 
 - Bring a warm reader forward by replaying only the delta batches other
