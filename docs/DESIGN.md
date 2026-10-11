@@ -56,26 +56,76 @@ full compressed scan plus selection. Correctness does not depend on locality.
 
 ```text
 turbovec0 virtual table
-    ├── warmed IdMapIndex (per SQLite connection)
-    ├── <name>_meta      dimensions, bit width, generation, byte length
+    ├── IdMapIndex, loaded when first needed (per SQLite connection)
+    ├── <name>_info      storage format, dimensions, bit width, generation,
+    │                    byte length, row count, delta bytes and operations
+    ├── <name>_ids       one row per rowid
     └── <name>_chunks    4 MiB base chunks plus committed delta batches
 ```
 
-`xBegin` starts an empty change log and `xSavepoint` records only its current
-position. Insert-only rollback removes appended rowids in reverse order.
-Ordinary deletes and replacements take no full-index checkpoint. If SQLite
-actually rolls back a destructive savepoint, the module reloads the committed
-index and replays the retained prefix. A full transaction rollback marks the
-warm copy stale and reloads it after SQLite has rolled back shadow writes. The
-only eager-checkpoint fallback is a mixed transaction that bulk-loaded without
-retaining raw vectors before its first destructive change.
+Connecting reads the `_info` row and nothing else. The index loads on the
+first nearest-neighbor query, or when a commit must compact. Rowid lookups,
+full rowid scans, `count(*)`, and insert conflict checks read `_ids` until
+then. A loaded index answers them itself, as before.
+
+`xUpdate` writes `_ids` inside the caller's statement, so SQLite rolls it back
+with the statement, savepoint, or transaction, and its rows always match what
+the transaction has done. A write with no index loaded checks and updates
+`_ids`, appends the change and its float32 vector to the change log, and does
+not touch the index. A savepoint rollback in that state only truncates the log.
+A search inside such a transaction loads the committed index and replays the
+log first. A base under 1 MiB loads on the first write instead, since every
+commit rewrites it anyway.
+
+With the index loaded, `xBegin` starts an empty change log and `xSavepoint`
+records only its current position. Insert-only rollback removes appended
+rowids in reverse order. Ordinary deletes and replacements take no full-index
+checkpoint. If SQLite actually rolls back a destructive savepoint, the module
+drops the warm copy; the next use reloads the committed index and replays the
+retained prefix. A full transaction rollback does the same after SQLite has
+rolled back shadow writes. The only eager-checkpoint fallback is a mixed
+transaction on a base under 1 MiB that bulk-loaded without retaining raw
+vectors before its first delete or replacement. Every insert after that point
+keeps its vector, so the checkpoint precedes every destructive change and a
+rollback past it has only appends to undo.
 
 At `xSync`, changes are encoded in one checksummed delta BLOB. A delete stores
 its rowid; an insert or replacement stores its rowid and source float32 vector.
 Negative chunk IDs keep these batches separate from non-negative base chunks.
-The metadata byte length becomes a negative marker while deltas exist, which
-makes older extensions fail closed instead of ignoring newer state. Loading an
-index deserializes the base and replays delta batches in generation order.
+The byte length becomes a negative marker while deltas exist, which makes
+0.1.5 and older fail closed instead of ignoring newer state. `_info` carries
+the row count and the delta byte and operation counts, so a commit decides
+between a delta and a compaction without the index; only a compaction loads
+it. Loading an index deserializes the base, replays delta batches in
+generation order, and checks the result against the `_info` row count.
+
+The row count lives in `_info` rather than being counted from `_ids` because
+every commit and every planner estimate needs it, and counting `_ids` walks its
+whole B-tree: 7.7 MiB at a million rows, against one row. `PRAGMA
+integrity_check` compares the counts, `_ids`, and the index.
+
+### Storage format and upgrades
+
+0.2.0 kept its metadata in `<name>_meta` and had no `_ids`. 0.3.0 still opens
+that layout, loading the index on connect as 0.2.0 did. The first commit
+that writes to it upgrades it, inside the same transaction: it creates `_info`
+and `_ids`, fills `_ids` from the loaded index, and deletes the `_meta` row.
+The chunk and delta formats do not change. A rolled-back commit rolls the
+upgrade back too. Reads alone never upgrade.
+
+Deleting the `_meta` row is what makes 0.2.0 refuse the upgraded index. Every
+0.2.0 code path reads that row first: connecting, the generation check before
+each read and each write transaction, `turbovec_info()`, and the integrity
+check. A 0.2.0 connection that was already open fails at its next statement
+instead of writing rows that `_ids` would not record. The error is SQLite's
+"Query returned no rows". Changing what a `_meta` column means would not have
+been enough: an open 0.2.0 connection reads only `generation` before writing a
+delta, and its delta write accepts any byte length. Deleting the row also needs
+no schema change to an existing table inside the commit. The upgraded index
+keeps an empty `_meta`; a new index never creates one.
+
+`_info.format` is 1. A later build that must be refused by this one raises it,
+and this build then reports the unsupported format by number.
 
 Compaction is deliberately simple. When deltas reach 25% of the base bytes,
 16 MiB, or 25% of the current row count (with a 10,000-operation floor),
@@ -166,9 +216,10 @@ calls that host API-table function directly.
 - Small commits append operation batches, but compaction still traverses the
   complete index, and actual destructive savepoint rollback still materializes
   the full base image.
-- Opening an index still holds one full copy of the byte image alongside the
-  index built from it, because TurboVec's loader reads its input into an owned
-  buffer. A constructor that consumes a `Vec<u8>` would remove the last copy.
+- The first search on a connection still loads the whole base image, and
+  holds one full copy of the byte image alongside the index built from it,
+  because TurboVec's loader reads its input into an owned buffer. A constructor
+  that consumes a `Vec<u8>` would remove the last copy.
 - Delta inserts and replacements retain raw float32 vectors until compaction;
   deletes retain only rowids.
 - Allowlist pushdown accepts SQLite INTEGER rowids, not arbitrary virtual-table

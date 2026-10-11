@@ -61,6 +61,43 @@ def actual_ids(connection: sqlite3.Connection) -> set[int]:
     return {row[0] for row in connection.execute("select rowid from vectors")}
 
 
+def stored_ids(connection: sqlite3.Connection) -> list[int]:
+    """The `_ids` shadow table, which writes keep in step with the index."""
+    return [row[0] for row in connection.execute("select id from vectors_ids order by id")]
+
+
+def indexed_ids(connection: sqlite3.Connection, count: int, dimensions: int) -> set[int]:
+    """Every rowid the compressed index holds: a KNN over all of it. This
+    loads the index if the connection has not, replaying unwritten changes."""
+    return {
+        row[0]
+        for row in connection.execute(
+            "select rowid from vectors where embedding match ? and k=?",
+            (vector(1, dimensions), count + 8),
+        )
+    }
+
+
+def assert_ids(connection: sqlite3.Connection, expected: dict[int, int], dimensions: int) -> None:
+    """Compare the model with `_ids`, a rowid scan, and the index itself."""
+    model = sorted(expected)
+    stored = stored_ids(connection)
+    if stored != model:
+        raise AssertionError(
+            f"_ids mismatch: missing={sorted(set(model) - set(stored))[:10]}, "
+            f"extra={sorted(set(stored) - set(model))[:10]}"
+        )
+    scanned = actual_ids(connection)
+    if scanned != expected.keys():
+        raise AssertionError(f"rowid scan mismatch: {sorted(scanned ^ expected.keys())[:10]}")
+    indexed = indexed_ids(connection, len(model), dimensions)
+    if indexed != expected.keys():
+        raise AssertionError(
+            f"index mismatch: missing={sorted(expected.keys() - indexed)[:10]}, "
+            f"extra={sorted(indexed - expected.keys())[:10]}"
+        )
+
+
 # A stored vector that matches its expected version scores ~1.0; any other
 # version of the same rowid scores well under this.
 SELF_MATCH_FLOOR = 0.9
@@ -80,6 +117,7 @@ def assert_model(
     count = connection.execute("select count(*) from vectors").fetchone()[0]
     if count != len(expected):
         raise AssertionError(f"count mismatch: SQLite={count}, model={len(expected)}")
+    assert_ids(connection, expected, dimensions)
     # Content check on the rowids this transaction actually touched: they are
     # the only ones whose stored vector could have gone stale.
     for rowid in sorted(sample & expected.keys())[:12]:
@@ -123,11 +161,20 @@ def main() -> None:
 
         for seed in range(args.seeds):
             rng = random.Random(0x5EED + seed)
+            # A fresh connection has not loaded the index. Above the 1 MiB
+            # base floor its writes go to _ids and the change list only.
+            if rng.randrange(3) == 0:
+                connection.close()
+                connection = connect(database, args.extension)
             before = dict(expected)
             savepoint: dict[int, int] | None = None
             touched: set[int] = set()
             connection.execute("begin immediate")
             for step in range(args.steps):
+                if rng.randrange(16) == 0:
+                    # Mid-transaction search: loads the index if needed and
+                    # replays the changes made so far.
+                    assert_ids(connection, expected, args.dimensions)
                 choice = rng.randrange(100)
                 rowid = rng.randrange(1, args.seeds * 4 + 65)
                 # Versions must not repeat across steps for one rowid, or a
@@ -186,6 +233,9 @@ def main() -> None:
                 connection.close()
                 connection = connect(database, args.extension)
                 assert_model(connection, expected, args.dimensions, touched)
+                reports = [row[0] for row in connection.execute("pragma integrity_check")]
+                if reports != ["ok"]:
+                    raise AssertionError(f"integrity check failed: {reports}")
 
         reports = [row[0] for row in connection.execute("pragma integrity_check")]
         if reports != ["ok"]:

@@ -41,6 +41,32 @@ inserts with FTS5 triggers before and after a `turbovec0` write. On the Apple M1
 used here, the post-write sequence fell from 453.9 ms in 0.1.1 to 0.67 ms in
 0.1.2. The check permits timing noise but rejects index-sized savepoint work.
 
+For a one-row commit from a fresh process, the way a sync tool runs:
+
+```sh
+python3 benchmarks/fresh_commit.py \
+  --extension target/release/libturbovec_sqlite.dylib \
+  --baseline-extension /path/to/0.2.0/libturbovec_sqlite.dylib \
+  --workdir /tmp/turbovec-fresh-commit --rows 1000000 --repeat 5
+```
+
+It builds the index once with the baseline, then times a delete and re-insert
+of one row, and separately one search, each in a new process. The candidate's
+first commit on that index is also its one-time storage upgrade. On the Apple
+M1 used here, with a warm page cache, 1,000,000 rows, 1,536 dimensions, and a
+745 MiB base ([raw results](../benchmarks/results/fresh-commit-20261011.json)):
+
+| case | median ms | peak RSS MiB |
+|---|---:|---:|
+| 0.2.0 commit | 468.1 | 830.4 |
+| one-time upgrade commit | 1,108.8 | 832.4 |
+| commit after upgrade | 0.8 | 24.5 |
+| 0.2.0 first search | 462.5 | 830.5 |
+| first search after upgrade | 462.0 | 830.5 |
+
+The commit no longer reads the base image, so a cold or busy disk no longer
+slows it. The first search on a connection still loads it.
+
 For filtered search:
 
 ```sh

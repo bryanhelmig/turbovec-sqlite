@@ -430,6 +430,39 @@ fn extension_init(db: Connection) -> Result<bool> {
     Ok(false)
 }
 
+/// Keep this library mapped until the process exits.
+///
+/// SQLite unloads a loadable extension when the last connection that loaded it
+/// closes. Every search starts TurboVec's rayon worker threads, which keep
+/// running code from this library, so on Windows, where `FreeLibrary` unmaps
+/// it, they fault. Linux and macOS already keep the library loaded; pinning
+/// makes Windows do the same. A failure leaves the old behavior, so it is
+/// ignored.
+#[cfg(windows)]
+fn pin_library() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleExW(
+            flags: u32,
+            module_name: *const u16,
+            module: *mut *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+    let mut module = std::ptr::null_mut();
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            (pin_library as fn()) as *const u16,
+            &mut module,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn pin_library() {}
+
 /// SQLite's conventional loadable-extension entry point.
 ///
 /// # Safety
@@ -442,6 +475,7 @@ pub unsafe extern "C" fn sqlite3_extension_init(
     error_message: *mut *mut c_char,
     api: *mut ffi::sqlite3_api_routines,
 ) -> c_int {
+    pin_library();
     unsafe {
         chunked::initialize_api(api);
         Connection::extension_init2(db, error_message, api, extension_init)
@@ -459,6 +493,7 @@ pub unsafe extern "C" fn sqlite3_turbovec_init(
     error_message: *mut *mut c_char,
     api: *mut ffi::sqlite3_api_routines,
 ) -> c_int {
+    pin_library();
     unsafe {
         chunked::initialize_api(api);
         Connection::extension_init2(db, error_message, api, extension_init)

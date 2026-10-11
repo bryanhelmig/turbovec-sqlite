@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.2.0
+version=0.3.0
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.2.0-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.3.0-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -86,7 +86,8 @@ select changes();
 
 Read `changes()` immediately after the insert, before an explicit `COMMIT`:
 commit-time shadow writes can replace that count. `last_insert_rowid()` is
-preserved across commit.
+preserved across commit. Each insert and delete also writes one row of the
+`<name>_ids` shadow table, which `total_changes()` counts.
 
 Some SQLite hosts emit `RETURNING` rows even for ignored virtual-table inserts.
 If returned rows must identify only successful inserts, filter duplicates before
@@ -144,7 +145,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.2.0
+-- 0.3.0
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
@@ -161,9 +162,14 @@ See [`examples/demo.sql`](examples/demo.sql) for a complete CLI example.
 
 ## What things cost
 
-The warm index is per connection. Opening it remains O(index), so hold a
-connection open when the host permits it. Since 0.1.6, ordinary write cost is
-proportional to the changes:
+The warm index is per connection, and a connection loads it only for its
+first search or for a commit that compacts. Loading remains O(index), so hold a
+connection open for searches when the host permits it. A connection that only
+writes never loads it: rowid checks, rowid lookups, and `count(*)` read the
+`<name>_ids` shadow table instead. On a 1,000,000-row, 1,536-dimensional index
+(745 MiB base), a one-row delete-and-insert commit from a fresh process took
+0.8 ms and 24.5 MiB peak RSS, against 468 ms and 830 MiB in 0.2.0, with a warm
+page cache. Since 0.1.6, ordinary write cost is proportional to the changes:
 
 - deletes append rowids;
 - inserts and replacements append rowids plus float32 vectors;
@@ -196,8 +202,8 @@ case. These are measurements, not hardware promises. Reproduce them with
 
 The operational advice is simple:
 
-1. Hold a connection open when the host permits it. A one-shot CLI pays the
-   load on every run.
+1. Hold a connection open for searches when the host permits it. A one-shot
+   CLI pays the load on its first search, not on writes.
 2. Batch related vector writes in one transaction. It reduces SQLite and fsync
    overhead even though small vector commits are now cheap.
 
@@ -210,9 +216,10 @@ commit;
 ```
 
 Ordinary deletes do not copy the index for rollback. If SQLite actually rolls
-back a destructive savepoint, the extension reloads the committed base and
-replays the retained transaction prefix. That makes the common path cheap and
-moves O(index) work to the rare rollback path.
+back a destructive savepoint, the extension drops its loaded copy and, when it
+next needs one, reloads the committed base and replays the retained transaction
+prefix. That makes the common path cheap and moves O(index) work to the rare
+rollback path.
 
 ## Keep content and vectors in sync
 
@@ -320,15 +327,18 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and base disk format are separate. Version 0.2.0 reads and
-writes the same TurboVec format v7, revision 2 base image, shadow schema, and
-delta records as 0.1.6, so no index rebuild is needed in either direction. What
-0.2.0 changed is when compaction runs, not what it produces. Small commits may
-add extension-owned delta records. Versions before 0.1.6 refuse an index while
-those deltas are present instead of silently ignoring them. During 0.x, a release may intentionally break disk
-compatibility and will say so in the changelog. The extension checks the header
-before deserialization and refuses another format or revision with a specific
-error. Keep a recoverable copy of source embeddings.
+The crate version and base disk format are separate. The base image is TurboVec
+format v7, revision 2, and the delta records are unchanged since 0.1.6. 0.3.0
+adds two shadow tables, `<name>_info` and `<name>_ids`, so that writes
+need not load the compressed index. It opens a 0.2.0 index without a rebuild,
+and the first commit that writes to it upgrades it in place. The upgrade is
+one-way: 0.2.0 then refuses the index, reporting "Query returned no rows",
+including a 0.2.0 connection that was already open. Move every process that
+opens the database to 0.3.0 before the first write. Versions before 0.1.6 refuse an
+index while delta records are present. During 0.x, a release may intentionally
+break disk compatibility and will say so in the changelog. The extension checks
+the header before deserialization and refuses another format or revision with a
+specific error. Keep a recoverable copy of source embeddings.
 
 ## Development
 
