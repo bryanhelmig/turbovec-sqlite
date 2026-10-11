@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.2.0
+version=0.3.0
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.2.0-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.3.0-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -145,7 +145,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.2.0
+-- 0.3.0
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
@@ -328,13 +328,13 @@ when exact ranking is required.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
 The crate version and base disk format are separate. The base image is TurboVec
-format v7, revision 2, and the delta records are unchanged since 0.1.6. This
-version adds two shadow tables, `<name>_info` and `<name>_ids`, so that writes
+format v7, revision 2, and the delta records are unchanged since 0.1.6. 0.3.0
+adds two shadow tables, `<name>_info` and `<name>_ids`, so that writes
 need not load the compressed index. It opens a 0.2.0 index without a rebuild,
 and the first commit that writes to it upgrades it in place. The upgrade is
 one-way: 0.2.0 then refuses the index, reporting "Query returned no rows",
-including a 0.2.0 connection that was already open. Upgrade every process that
-writes the database before the first write. Versions before 0.1.6 refuse an
+including a 0.2.0 connection that was already open. Move every process that
+opens the database to 0.3.0 before the first write. Versions before 0.1.6 refuse an
 index while delta records are present. During 0.x, a release may intentionally
 break disk compatibility and will say so in the changelog. The extension checks
 the header before deserialization and refuses another format or revision with a

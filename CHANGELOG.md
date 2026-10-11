@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-11
 
 - Commit inserts and deletes without loading the compressed index. A new
   `<name>_ids` shadow table answers rowid conflict checks, rowid lookups, full

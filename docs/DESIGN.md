@@ -106,8 +106,8 @@ integrity_check` compares the counts, `_ids`, and the index.
 
 ### Storage format and upgrades
 
-0.2.0 kept its metadata in `<name>_meta` and had no `_ids`. This version still
-opens that layout, loading the index on connect as 0.2.0 did. The first commit
+0.2.0 kept its metadata in `<name>_meta` and had no `_ids`. 0.3.0 still opens
+that layout, loading the index on connect as 0.2.0 did. The first commit
 that writes to it upgrades it, inside the same transaction: it creates `_info`
 and `_ids`, fills `_ids` from the loaded index, and deletes the `_meta` row.
 The chunk and delta formats do not change. A rolled-back commit rolls the
