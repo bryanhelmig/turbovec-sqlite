@@ -24,6 +24,12 @@ use turbovec::IdMapIndex;
 use crate::{TURBOVEC_FORMAT_REVISION, TURBOVEC_FORMAT_VERSION, check_format, parse_vector};
 
 const MODULE_NAME: &CStr = c"turbovec0";
+/// Shadow tables a `turbovec0` table may own. `meta` is the 0.2.0 metadata
+/// table; an upgraded index keeps it empty, and a new one never creates it.
+const SHADOW_SUFFIXES: [&str; 4] = ["meta", "info", "ids", "chunks"];
+/// The `_info` layout this build reads and writes. Raise it when a change
+/// must make this build refuse an index.
+const STORAGE_FORMAT: i64 = 1;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const DELTA_MAGIC: &[u8; 4] = b"TVD1";
 const DELTA_HEADER_LEN: usize = 12;
@@ -337,7 +343,11 @@ unsafe extern "C" fn shadow_name(name: *const c_char) -> c_int {
         return 0;
     }
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    c_int::from(name.eq_ignore_ascii_case(b"meta") || name.eq_ignore_ascii_case(b"chunks"))
+    c_int::from(
+        SHADOW_SUFFIXES
+            .iter()
+            .any(|suffix| name.eq_ignore_ascii_case(suffix.as_bytes())),
+    )
 }
 
 unsafe fn set_vtab_error(table: *mut ffi::sqlite3_vtab, message: &str) -> c_int {
@@ -460,18 +470,31 @@ fn parse_geometry(args: &[&[u8]]) -> Result<(usize, usize)> {
     ))
 }
 
-fn names(database: &[u8], table: &[u8]) -> Result<(String, String)> {
-    Ok(names_str(
-        std::str::from_utf8(database)?,
-        std::str::from_utf8(table)?,
-    ))
+/// Schema-qualified, quoted shadow-table names.
+struct ShadowNames {
+    meta: String,
+    info: String,
+    ids: String,
+    chunks: String,
+    /// Unqualified, because incremental BLOB I/O takes the schema separately.
+    chunks_table: String,
 }
 
-fn names_str(database: &str, table: &str) -> (String, String) {
-    (
-        format!("{}.{}", quote(database), quote(&format!("{table}_meta"))),
-        format!("{}.{}", quote(database), quote(&format!("{table}_chunks"))),
-    )
+fn shadow_names(database: &str, table: &str) -> ShadowNames {
+    let qualified = |suffix: &str| {
+        format!(
+            "{}.{}",
+            quote(database),
+            quote(&format!("{table}_{suffix}"))
+        )
+    };
+    ShadowNames {
+        meta: qualified("meta"),
+        info: qualified("info"),
+        ids: qualified("ids"),
+        chunks: qualified("chunks"),
+        chunks_table: format!("{table}_chunks"),
+    }
 }
 
 fn connection(handle: *mut ffi::sqlite3) -> Result<Connection> {
@@ -480,12 +503,241 @@ fn connection(handle: *mut ffi::sqlite3) -> Result<Connection> {
     unsafe { Connection::from_handle(handle) }
 }
 
-fn read_generation(connection: &Connection, meta: &str) -> Result<i64> {
+fn table_exists(connection: &Connection, database: &str, name: &str) -> Result<bool> {
     connection.query_row(
-        &format!("SELECT generation FROM {meta} WHERE id=1"),
-        [],
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {}.sqlite_schema \
+             WHERE type='table' AND name=?1 COLLATE NOCASE)",
+            quote(database)
+        ),
+        [name],
         |row| row.get(0),
     )
+}
+
+/// Which table holds an index's metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// Written by 0.2.0 and earlier: `_meta` and `_chunks`, and no rowid
+    /// table, so every write must load the index to check rowids.
+    Legacy,
+    /// `_info`, `_ids`, and `_chunks`. `_ids` answers rowid questions, and
+    /// `_info` holds the counts a commit needs, so writes can skip the index.
+    Current,
+}
+
+fn detect_layout(connection: &Connection, database: &str, table: &str) -> Result<Layout> {
+    let info = table_exists(connection, database, &format!("{table}_info"))?;
+    let ids = table_exists(connection, database, &format!("{table}_ids"))?;
+    match (info, ids) {
+        (false, false) => Ok(Layout::Legacy),
+        (true, true) => Ok(Layout::Current),
+        _ => Err(error(format!(
+            "turbovec0 {table} has only one of its _info and _ids shadow tables"
+        ))),
+    }
+}
+
+fn check_storage_format(format: i64) -> Result<()> {
+    if format == STORAGE_FORMAT {
+        return Ok(());
+    }
+    Err(error(format!(
+        "unsupported turbovec0 storage format {format}; \
+         this extension reads format {STORAGE_FORMAT}"
+    )))
+}
+
+/// Decode a stored byte length. A non-negative value is the base image length.
+/// While delta batches exist it is stored as `-length-1`, which made 0.1.5 and
+/// earlier fail closed instead of ignoring them.
+fn decode_byte_len(stored: i64) -> Result<(usize, bool)> {
+    let has_deltas = stored < 0;
+    let length = if has_deltas {
+        stored
+            .checked_neg()
+            .and_then(|length| length.checked_sub(1))
+            .ok_or_else(|| error("invalid persisted TurboVec byte length"))?
+    } else {
+        stored
+    };
+    let length = usize::try_from(length)
+        .map_err(|_| error("negative or oversized persisted TurboVec byte length"))?;
+    Ok((length, has_deltas))
+}
+
+fn sql_integer(value: usize, label: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| error(format!("turbovec0 {label} is too large")))
+}
+
+fn sql_id(id: u64) -> Result<i64> {
+    i64::try_from(id).map_err(|_| error("TurboVec id is too large for a SQLite rowid"))
+}
+
+/// The `_info` row: everything a commit needs to decide between a delta and a
+/// compaction without loading the index.
+struct Info {
+    generation: i64,
+    base_bytes: usize,
+    row_count: usize,
+    delta_bytes: usize,
+    delta_operations: usize,
+}
+
+fn read_info(connection: &Connection, info: &str) -> Result<Info> {
+    let (format, generation, byte_len, row_count, delta_bytes, delta_operations): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = connection.query_row(
+        &format!(
+            "SELECT format, generation, byte_len, row_count, delta_bytes, delta_operations \
+             FROM {info} WHERE id=1"
+        ),
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    check_storage_format(format)?;
+    let count = |value: i64, label: &str| {
+        usize::try_from(value).map_err(|_| error(format!("invalid turbovec0 {label} in _info")))
+    };
+    Ok(Info {
+        generation,
+        base_bytes: decode_byte_len(byte_len)?.0,
+        row_count: count(row_count, "row count")?,
+        delta_bytes: count(delta_bytes, "delta byte count")?,
+        delta_operations: count(delta_operations, "delta operation count")?,
+    })
+}
+
+fn create_info_and_ids(connection: &Connection, names: &ShadowNames) -> Result<()> {
+    connection.execute_batch(&format!(
+        "CREATE TABLE {}(\
+           id INTEGER PRIMARY KEY CHECK(id=1),\
+           format INTEGER NOT NULL,\
+           dimensions INTEGER NOT NULL,\
+           bit_width INTEGER NOT NULL,\
+           generation INTEGER NOT NULL,\
+           byte_len INTEGER NOT NULL,\
+           row_count INTEGER NOT NULL,\
+           delta_bytes INTEGER NOT NULL,\
+           delta_operations INTEGER NOT NULL\
+         );\
+         CREATE TABLE {}(id INTEGER PRIMARY KEY);",
+        names.info, names.ids
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_info(
+    connection: &Connection,
+    info: &str,
+    dimensions: usize,
+    bit_width: usize,
+    generation: i64,
+    byte_len: i64,
+    row_count: usize,
+    delta_bytes: usize,
+    delta_operations: usize,
+) -> Result<()> {
+    let _rowid = PreserveLastInsertRowid {
+        connection,
+        rowid: connection.last_insert_rowid(),
+    };
+    connection.execute(
+        &format!(
+            "INSERT INTO {info}(id, format, dimensions, bit_width, generation, byte_len, \
+             row_count, delta_bytes, delta_operations) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        params![
+            STORAGE_FORMAT,
+            sql_integer(dimensions, "dimension")?,
+            sql_integer(bit_width, "bit width")?,
+            generation,
+            byte_len,
+            sql_integer(row_count, "row count")?,
+            sql_integer(delta_bytes, "delta byte count")?,
+            sql_integer(delta_operations, "delta operation count")?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_compaction(
+    connection: &Connection,
+    info: &str,
+    generation: i64,
+    byte_len: usize,
+    row_count: usize,
+) -> Result<()> {
+    let updated = connection.execute(
+        &format!(
+            "UPDATE {info} SET generation=?1, byte_len=?2, row_count=?3, \
+             delta_bytes=0, delta_operations=0 WHERE id=1"
+        ),
+        params![
+            generation,
+            sql_integer(byte_len, "byte length")?,
+            sql_integer(row_count, "row count")?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(error("turbovec0 _info row is missing"));
+    }
+    Ok(())
+}
+
+fn record_delta(
+    connection: &Connection,
+    info: &str,
+    generation: i64,
+    row_count: usize,
+    delta_bytes: usize,
+    delta_operations: usize,
+) -> Result<()> {
+    let updated = connection.execute(
+        &format!(
+            "UPDATE {info} SET generation=?1, \
+             byte_len=CASE WHEN byte_len>=0 THEN -byte_len-1 ELSE byte_len END, \
+             row_count=?2, delta_bytes=?3, delta_operations=?4 WHERE id=1"
+        ),
+        params![
+            generation,
+            sql_integer(row_count, "row count")?,
+            sql_integer(delta_bytes, "delta byte count")?,
+            sql_integer(delta_operations, "delta operation count")?,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(error("turbovec0 _info row is missing"));
+    }
+    Ok(())
+}
+
+/// Rows added minus rows removed by a run of transaction changes.
+fn net_rows(changes: &[Change]) -> isize {
+    changes
+        .iter()
+        .map(|change| match change {
+            Change::Insert { replaces: true, .. } => 0,
+            Change::Insert {
+                replaces: false, ..
+            } => 1,
+            Change::Delete { .. } => -1,
+        })
+        .sum()
 }
 
 /// Validate the stored geometry and report what the base image should contain.
@@ -505,17 +757,7 @@ fn validate_chunks(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let has_deltas = stored_len < 0;
-    let expected_len = if has_deltas {
-        stored_len
-            .checked_neg()
-            .and_then(|length| length.checked_sub(1))
-            .ok_or_else(|| error("invalid persisted TurboVec byte length"))?
-    } else {
-        stored_len
-    };
-    let expected_len = usize::try_from(expected_len)
-        .map_err(|_| error("negative or oversized persisted TurboVec byte length"))?;
+    let (expected_len, has_deltas) = decode_byte_len(stored_len)?;
     let mut statement = connection.prepare(&format!(
         "SELECT chunk_id, length(data), typeof(data) FROM {chunks} \
          WHERE chunk_id>=0 ORDER BY chunk_id"
@@ -881,9 +1123,18 @@ pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Resu
         )));
     }
 
-    let (meta, chunks) = names_str(database, table);
-    let chunks_table = format!("{table}_chunks");
-    let loaded = read_index(connection, database, &meta, &chunks, &chunks_table)?;
+    let names = shadow_names(database, table);
+    let metadata = match detect_layout(connection, database, table)? {
+        Layout::Legacy => &names.meta,
+        Layout::Current => &names.info,
+    };
+    let loaded = read_index(
+        connection,
+        database,
+        metadata,
+        &names.chunks,
+        &names.chunks_table,
+    )?;
     Ok(serde_json::json!({
         "table": qualified_table,
         "generation": loaded.generation,
@@ -1009,13 +1260,13 @@ impl Write for ChunkWriter<'_> {
     }
 }
 
+/// Stream the index over the base chunks and drop every delta batch. Returns
+/// the image length; the caller records it in the metadata row.
 fn write_index(
     connection: &Connection,
     database: &str,
-    meta: &str,
     chunks: &str,
     chunks_table: &str,
-    generation: i64,
     index: &IdMapIndex,
 ) -> Result<usize> {
     let _rowid = PreserveLastInsertRowid {
@@ -1057,20 +1308,12 @@ fn write_index(
         &format!("DELETE FROM {chunks} WHERE chunk_id < 0 OR chunk_id >= ?1"),
         [chunk_count],
     )?;
-    connection.execute(
-        &format!("UPDATE {meta} SET generation=?1, byte_len=?2 WHERE id=1"),
-        params![generation, byte_len],
-    )?;
     usize::try_from(byte_len).map_err(|_| error("invalid serialized turbovec0 byte length"))
 }
 
-fn write_delta(
-    connection: &Connection,
-    meta: &str,
-    chunks: &str,
-    generation: i64,
-    blob: &[u8],
-) -> Result<()> {
+/// Store one delta batch at `-generation`. The caller records it in the
+/// metadata row.
+fn write_delta(connection: &Connection, chunks: &str, generation: i64, blob: &[u8]) -> Result<()> {
     let _rowid = PreserveLastInsertRowid {
         connection,
         rowid: connection.last_insert_rowid(),
@@ -1082,13 +1325,6 @@ fn write_delta(
     connection.execute(
         &format!("INSERT INTO {chunks}(chunk_id,data) VALUES(?1,?2)"),
         params![chunk_id, blob],
-    )?;
-    connection.execute(
-        &format!(
-            "UPDATE {meta} SET generation=?1, \
-             byte_len=CASE WHEN byte_len>=0 THEN -byte_len-1 ELSE byte_len END WHERE id=1"
-        ),
-        [generation],
     )?;
     Ok(())
 }
@@ -1108,14 +1344,19 @@ fn validate_geometry(index: &IdMapIndex, dimensions: usize, bit_width: usize) ->
 }
 
 struct State {
+    layout: Layout,
+    /// Generation of the committed storage this state describes.
     generation: i64,
-    index: IdMapIndex,
+    /// The warm index, or `None` when the next use must reload it. When
+    /// loaded it includes this transaction's changes.
+    index: Option<IdMapIndex>,
     transaction: Option<TransactionState>,
     dirty: bool,
     base_bytes: usize,
     delta_bytes: usize,
     delta_operations: usize,
-    needs_reload: bool,
+    /// Rows in storage at `generation`, before this transaction's changes.
+    row_count: usize,
 }
 
 enum Change {
@@ -1139,28 +1380,29 @@ struct TransactionState {
     start_base_bytes: usize,
     start_delta_bytes: usize,
     start_delta_operations: usize,
+    start_row_count: usize,
     changes: Vec<Change>,
     destructive_checkpoint: Option<DestructiveCheckpoint>,
     savepoints: Vec<(c_int, usize)>,
     synced_changes: usize,
+    /// This transaction's commit gave a legacy index its `_info` and `_ids`.
+    /// Rolling back removes them again.
+    upgraded: bool,
 }
 
 impl TransactionState {
-    fn new(
-        start_generation: i64,
-        start_base_bytes: usize,
-        start_delta_bytes: usize,
-        start_delta_operations: usize,
-    ) -> Self {
+    fn start(state: &State) -> Self {
         Self {
-            start_generation,
-            start_base_bytes,
-            start_delta_bytes,
-            start_delta_operations,
+            start_generation: state.generation,
+            start_base_bytes: state.base_bytes,
+            start_delta_bytes: state.delta_bytes,
+            start_delta_operations: state.delta_operations,
+            start_row_count: state.row_count,
             changes: Vec::new(),
             destructive_checkpoint: None,
             savepoints: Vec::new(),
             synced_changes: 0,
+            upgraded: false,
         }
     }
 }
@@ -1170,11 +1412,129 @@ struct TurboVecTable {
     base: ffi::sqlite3_vtab,
     db: *mut ffi::sqlite3,
     database: String,
+    table: String,
     dimensions: usize,
-    meta: String,
-    chunks: String,
-    chunks_table: String,
+    bit_width: usize,
+    names: ShadowNames,
     state: Mutex<State>,
+}
+
+fn create_storage(
+    connection: &Connection,
+    database: &str,
+    names: &ShadowNames,
+    dimensions: usize,
+    bit_width: usize,
+) -> Result<State> {
+    let index = IdMapIndex::new(dimensions, bit_width)
+        .map_err(|cause| error(format!("invalid turbovec0 geometry: {cause}")))?;
+    create_info_and_ids(connection, names)?;
+    connection.execute_batch(&format!(
+        "CREATE TABLE {}(chunk_id INTEGER PRIMARY KEY, data BLOB NOT NULL);",
+        names.chunks
+    ))?;
+    let base_bytes = write_index(
+        connection,
+        database,
+        &names.chunks,
+        &names.chunks_table,
+        &index,
+    )?;
+    insert_info(
+        connection,
+        &names.info,
+        dimensions,
+        bit_width,
+        0,
+        sql_integer(base_bytes, "byte length")?,
+        0,
+        0,
+        0,
+    )?;
+    Ok(State {
+        layout: Layout::Current,
+        generation: 0,
+        index: Some(index),
+        transaction: None,
+        dirty: false,
+        base_bytes,
+        delta_bytes: 0,
+        delta_operations: 0,
+        row_count: 0,
+    })
+}
+
+fn open_storage(
+    connection: &Connection,
+    database: &str,
+    table: &str,
+    names: &ShadowNames,
+    dimensions: usize,
+    bit_width: usize,
+) -> Result<State> {
+    let layout = detect_layout(connection, database, table)?;
+    let metadata = match layout {
+        Layout::Legacy => &names.meta,
+        Layout::Current => {
+            // Check the format alone first, so a later layout that changes
+            // other columns is still refused with this message.
+            let format: i64 = connection.query_row(
+                &format!("SELECT format FROM {} WHERE id=1", names.info),
+                [],
+                |row| row.get(0),
+            )?;
+            check_storage_format(format)?;
+            &names.info
+        }
+    };
+    let stored: (i64, i64) = connection.query_row(
+        &format!("SELECT dimensions, bit_width FROM {metadata} WHERE id=1"),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if stored != (dimensions as i64, bit_width as i64) {
+        return Err(error(format!(
+            "turbovec0 schema says dimensions={dimensions}, bit_width={bit_width}; \
+             shadow metadata says dimensions={}, bit_width={}",
+            stored.0, stored.1
+        )));
+    }
+    if layout == Layout::Current {
+        // The first use loads the index.
+        let info = read_info(connection, &names.info)?;
+        return Ok(State {
+            layout,
+            generation: info.generation,
+            index: None,
+            transaction: None,
+            dirty: false,
+            base_bytes: info.base_bytes,
+            delta_bytes: info.delta_bytes,
+            delta_operations: info.delta_operations,
+            row_count: info.row_count,
+        });
+    }
+    // A legacy index has no rowid table, so the connection loads it now, as
+    // every connection did before. Its first commit adds `_info` and `_ids`.
+    let loaded = read_index(
+        connection,
+        database,
+        &names.meta,
+        &names.chunks,
+        &names.chunks_table,
+    )?;
+    validate_geometry(&loaded.index, dimensions, bit_width)?;
+    Ok(State {
+        layout,
+        generation: loaded.generation,
+        row_count: loaded.index.len(),
+        index: Some(loaded.index),
+        transaction: None,
+        dirty: false,
+        base_bytes: loaded.base_bytes,
+        delta_bytes: loaded.delta_bytes,
+        delta_operations: loaded.delta_operations,
+    })
 }
 
 impl TurboVecTable {
@@ -1223,116 +1583,90 @@ impl TurboVecTable {
         Self::configure(db)?;
         let (dimensions, bit_width) = parse_geometry(args)?;
         let database = std::str::from_utf8(database_name)?.to_owned();
-        let table = std::str::from_utf8(table_name)?;
-        let (meta, chunks) = names(database_name, table_name)?;
-        let chunks_table = format!("{table}_chunks");
+        let table = std::str::from_utf8(table_name)?.to_owned();
+        let names = shadow_names(&database, &table);
         let handle = unsafe { db.handle() };
         let connection = connection(handle)?;
-
-        let loaded = if create {
-            let index = IdMapIndex::new(dimensions, bit_width)
-                .map_err(|cause| error(format!("invalid turbovec0 geometry: {cause}")))?;
-            connection.execute_batch(&format!(
-                "CREATE TABLE {meta}(\
-                   id INTEGER PRIMARY KEY CHECK(id=1),\
-                   dimensions INTEGER NOT NULL,\
-                   bit_width INTEGER NOT NULL,\
-                   generation INTEGER NOT NULL,\
-                   byte_len INTEGER NOT NULL\
-                 );\
-                 CREATE TABLE {chunks}(\
-                   chunk_id INTEGER PRIMARY KEY,\
-                   data BLOB NOT NULL\
-                 );"
-            ))?;
-            connection.execute(
-                &format!(
-                    "INSERT INTO {meta}(id, dimensions, bit_width, generation, byte_len) \
-                     VALUES (1, ?1, ?2, 0, 0)"
-                ),
-                params![dimensions as i64, bit_width as i64],
-            )?;
-            let base_bytes = write_index(
+        let state = if create {
+            create_storage(&connection, &database, &names, dimensions, bit_width)?
+        } else {
+            open_storage(
                 &connection,
                 &database,
-                &meta,
-                &chunks,
-                &chunks_table,
-                0,
-                &index,
-            )?;
-            LoadedIndex {
-                generation: 0,
-                index,
-                base_bytes,
-                delta_bytes: 0,
-                delta_operations: 0,
-            }
-        } else {
-            let stored: (i64, i64) = connection.query_row(
-                &format!("SELECT dimensions, bit_width FROM {meta} WHERE id=1"),
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if stored != (dimensions as i64, bit_width as i64) {
-                return Err(error(format!(
-                    "turbovec0 schema says dimensions={dimensions}, bit_width={bit_width}; \
-                     shadow metadata says dimensions={}, bit_width={}",
-                    stored.0, stored.1
-                )));
-            }
-            let loaded = read_index(&connection, &database, &meta, &chunks, &chunks_table)?;
-            validate_geometry(&loaded.index, dimensions, bit_width)?;
-            loaded
+                &table,
+                &names,
+                dimensions,
+                bit_width,
+            )?
         };
-
         Ok(Self {
             base: ffi::sqlite3_vtab::default(),
             db: handle,
             database,
+            table,
             dimensions,
-            meta,
-            chunks,
-            chunks_table,
-            state: Mutex::new(State {
-                generation: loaded.generation,
-                index: loaded.index,
-                transaction: None,
-                dirty: false,
-                base_bytes: loaded.base_bytes,
-                delta_bytes: loaded.delta_bytes,
-                delta_operations: loaded.delta_operations,
-                needs_reload: false,
-            }),
+            bit_width,
+            names,
+            state: Mutex::new(state),
         })
     }
 
-    fn refresh<'a>(&self, state: &'a mut State) -> Result<&'a mut State> {
+    fn metadata_table(&self, layout: Layout) -> &str {
+        match layout {
+            Layout::Legacy => &self.names.meta,
+            Layout::Current => &self.names.info,
+        }
+    }
+
+    /// Bring the state up to committed storage. Inside a transaction this
+    /// connection holds the write lock, so its state is already current.
+    fn refresh(&self, state: &mut State) -> Result<()> {
         if state.transaction.is_some() {
-            return Ok(state);
+            return Ok(());
         }
         let connection = connection(self.db)?;
-        let persisted_generation = read_generation(&connection, &self.meta)?;
-        if !state.needs_reload && persisted_generation == state.generation {
-            return Ok(state);
+        if state.layout == Layout::Legacy {
+            let generation: Option<i64> = connection
+                .query_row(
+                    &format!("SELECT generation FROM {} WHERE id=1", self.names.meta),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(generation) = generation else {
+                // Another connection's commit upgraded the index.
+                if detect_layout(&connection, &self.database, &self.table)? == Layout::Legacy {
+                    return Err(error("turbovec0 metadata row is missing"));
+                }
+                state.layout = Layout::Current;
+                state.index = None;
+                return self.refresh(state);
+            };
+            if state.index.is_some() && generation == state.generation {
+                return Ok(());
+            }
+            if state.index.is_some() && self.catch_up(&connection, state, generation)? {
+                state.row_count = state.index.as_ref().map_or(0, IdMapIndex::len);
+                return Ok(());
+            }
+            state.index = None;
+            self.ensure_loaded(state)?;
+            return Ok(());
         }
-        if !state.needs_reload && self.catch_up(&connection, state, persisted_generation)? {
-            return Ok(state);
+        let info = read_info(&connection, &self.names.info)?;
+        if state.index.is_some()
+            && info.generation != state.generation
+            && !self.catch_up(&connection, state, info.generation)?
+        {
+            state.index = None;
         }
-        let loaded = read_index(
-            &connection,
-            &self.database,
-            &self.meta,
-            &self.chunks,
-            &self.chunks_table,
-        )?;
-        state.generation = loaded.generation;
-        state.index = loaded.index;
-        state.base_bytes = loaded.base_bytes;
-        state.delta_bytes = loaded.delta_bytes;
-        state.delta_operations = loaded.delta_operations;
-        state.needs_reload = false;
-        Ok(state)
+        state.generation = info.generation;
+        state.base_bytes = info.base_bytes;
+        state.delta_bytes = info.delta_bytes;
+        state.delta_operations = info.delta_operations;
+        state.row_count = info.row_count;
+        self.ensure_loaded(state)?;
+        Ok(())
     }
 
     /// Bring a warm copy forward by replaying only the delta batches other
@@ -1345,8 +1679,7 @@ impl TurboVecTable {
     /// base and deletes every delta in the same statement, so a delta older
     /// than us could not have survived one. Everything else — a compaction, a
     /// gap in the chain, a generation that does not land exactly on the
-    /// persisted one — returns `false` and lets the caller do the full read,
-    /// which is also the only path that can correct `base_bytes`.
+    /// persisted one — returns `false`, and the caller drops the copy.
     fn catch_up(
         &self,
         connection: &Connection,
@@ -1359,7 +1692,10 @@ impl TurboVecTable {
         // Deltas live at chunk_id = -generation, so the greatest negative
         // chunk_id is the oldest surviving batch.
         let oldest: Option<i64> = connection.query_row(
-            &format!("SELECT max(chunk_id) FROM {} WHERE chunk_id<0", self.chunks),
+            &format!(
+                "SELECT max(chunk_id) FROM {} WHERE chunk_id<0",
+                self.names.chunks
+            ),
             [],
             |row| row.get(0),
         )?;
@@ -1372,14 +1708,16 @@ impl TurboVecTable {
         let mut statement = connection.prepare(&format!(
             "SELECT chunk_id, data, typeof(data) FROM {} \
              WHERE chunk_id<0 AND chunk_id<?1 ORDER BY chunk_id DESC",
-            self.chunks
+            self.names.chunks
         ))?;
         let mut rows = statement.query([-state.generation])?;
-        // Replay applies to the live warm copy, so a failure or a declined
-        // chain part-way through leaves it between generations. Arm the
-        // full-reload flag across the whole walk and clear it only after a
-        // complete, contiguous catch-up.
-        state.needs_reload = true;
+        // Replay applies to the warm copy itself, so a failure or a declined
+        // chain part-way through leaves it between generations. Take it out
+        // of the state for the walk and put it back only after a complete,
+        // contiguous catch-up; otherwise the next use reloads it.
+        let Some(mut index) = state.index.take() else {
+            return Ok(false);
+        };
         let mut generation = state.generation;
         let mut delta_bytes = state.delta_bytes;
         let mut delta_operations = state.delta_operations;
@@ -1397,7 +1735,7 @@ impl TurboVecTable {
             }
             let blob = row.get_ref(1)?.as_blob()?;
             let changes = decode_delta(blob, self.dimensions)?;
-            Self::replay(&mut state.index, &changes)?;
+            Self::replay(&mut index, &changes)?;
             delta_bytes = delta_bytes
                 .checked_add(blob.len())
                 .ok_or_else(|| error("oversized turbovec0 delta storage"))?;
@@ -1409,40 +1747,185 @@ impl TurboVecTable {
         if generation != persisted_generation {
             return Ok(false);
         }
+        state.index = Some(index);
         state.generation = generation;
         state.delta_bytes = delta_bytes;
         state.delta_operations = delta_operations;
-        state.needs_reload = false;
         Ok(true)
     }
 
-    fn rename(&mut self, new_name: &str) -> Result<()> {
-        let (new_meta, new_chunks) = names_str(&self.database, new_name);
+    /// The warm index, loaded from storage first if this connection has not
+    /// needed it yet. Changes the transaction has not written to storage are
+    /// replayed onto the loaded copy.
+    fn ensure_loaded<'a>(&self, state: &'a mut State) -> Result<&'a mut IdMapIndex> {
+        if state.index.is_none() {
+            let connection = connection(self.db)?;
+            let loaded = read_index(
+                &connection,
+                &self.database,
+                self.metadata_table(state.layout),
+                &self.names.chunks,
+                &self.names.chunks_table,
+            )?;
+            validate_geometry(&loaded.index, self.dimensions, self.bit_width)?;
+            // Inside a transaction storage cannot move under this connection.
+            // Outside one, a current layout's refresh() read `_info` in this
+            // same statement. Only a legacy refresh adopts what it finds.
+            let adopts_generation = state.transaction.is_none() && state.layout == Layout::Legacy;
+            if !adopts_generation && loaded.generation != state.generation {
+                return Err(error("turbovec0 storage changed while loading its index"));
+            }
+            let mut index = loaded.index;
+            if state.layout == Layout::Current && index.len() != state.row_count {
+                return Err(error(format!(
+                    "turbovec0 index holds {} rows; _info records {}",
+                    index.len(),
+                    state.row_count
+                )));
+            }
+            state.generation = loaded.generation;
+            state.row_count = index.len();
+            state.base_bytes = loaded.base_bytes;
+            state.delta_bytes = loaded.delta_bytes;
+            state.delta_operations = loaded.delta_operations;
+            if let Some(transaction) = state.transaction.as_ref() {
+                Self::replay(
+                    &mut index,
+                    &transaction.changes[transaction.synced_changes..],
+                )?;
+            }
+            state.index = Some(index);
+        }
+        Ok(state.index.as_mut().expect("index loaded above"))
+    }
+
+    /// Give a 0.2.0-layout index `_info` and `_ids`, and empty `_meta`. Every
+    /// 0.2.0 code path reads the `_meta` row first, so older builds refuse
+    /// the index from then on instead of writing without maintaining `_ids`.
+    /// Runs inside the first commit that writes to the index, from the copy
+    /// that commit already holds.
+    fn upgrade_storage(&self, connection: &Connection, state: &mut State) -> Result<()> {
+        self.ensure_loaded(state)?;
+        let byte_len: i64 = connection.query_row(
+            &format!("SELECT byte_len FROM {} WHERE id=1", self.names.meta),
+            [],
+            |row| row.get(0),
+        )?;
+        create_info_and_ids(connection, &self.names)?;
+        insert_info(
+            connection,
+            &self.names.info,
+            self.dimensions,
+            self.bit_width,
+            state.generation,
+            byte_len,
+            state.row_count,
+            state.delta_bytes,
+            state.delta_operations,
+        )?;
+        let mut ids: Vec<u64> = state
+            .index
+            .as_ref()
+            .expect("index loaded above")
+            .iter_ids()
+            .collect();
+        // Ascending keys append to the B-tree instead of splitting pages.
+        ids.sort_unstable();
+        {
+            let _rowid = PreserveLastInsertRowid {
+                connection,
+                rowid: connection.last_insert_rowid(),
+            };
+            let mut insert =
+                connection.prepare(&format!("INSERT INTO {}(id) VALUES (?1)", self.names.ids))?;
+            for id in ids {
+                insert.execute([sql_id(id)?])?;
+            }
+        }
+        connection.execute(&format!("DELETE FROM {} WHERE id=1", self.names.meta), [])?;
+        state.layout = Layout::Current;
+        if let Some(transaction) = state.transaction.as_mut() {
+            transaction.upgraded = true;
+        }
+        Ok(())
+    }
+
+    /// Add a rowid to `_ids`. Returns false, and writes nothing, when it is
+    /// already there.
+    fn add_id(&self, id: u64) -> Result<bool> {
         let connection = connection(self.db)?;
-        connection.execute_batch(&format!(
-            "ALTER TABLE {} RENAME TO {}; ALTER TABLE {} RENAME TO {}",
-            self.meta,
-            quote(&format!("{new_name}_meta")),
-            self.chunks,
-            quote(&format!("{new_name}_chunks")),
-        ))?;
-        self.meta = new_meta;
-        self.chunks = new_chunks;
-        self.chunks_table = format!("{new_name}_chunks");
+        let _rowid = PreserveLastInsertRowid {
+            connection: &connection,
+            rowid: connection.last_insert_rowid(),
+        };
+        let added = connection.execute(
+            &format!("INSERT OR IGNORE INTO {}(id) VALUES (?1)", self.names.ids),
+            [sql_id(id)?],
+        )?;
+        Ok(added == 1)
+    }
+
+    /// Remove a rowid from `_ids`. Returns false when it was not there.
+    fn remove_id(&self, id: u64) -> Result<bool> {
+        let connection = connection(self.db)?;
+        let removed = connection.execute(
+            &format!("DELETE FROM {} WHERE id=?1", self.names.ids),
+            [sql_id(id)?],
+        )?;
+        Ok(removed == 1)
+    }
+
+    fn stored_ids(&self) -> Result<Vec<u64>> {
+        let connection = connection(self.db)?;
+        let mut statement =
+            connection.prepare(&format!("SELECT id FROM {} ORDER BY id", self.names.ids))?;
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .map(|id| u64::try_from(id?).map_err(|_| error("negative rowid in turbovec0 _ids")))
+            .collect()
+    }
+
+    fn ids_disagree(&self, id: u64) -> Error {
+        error(format!(
+            "turbovec0 index and {}_ids disagree about rowid {id}; \
+             PRAGMA integrity_check reports the difference",
+            self.table
+        ))
+    }
+
+    fn rename(&mut self, new_name: &str) -> Result<()> {
+        let connection = connection(self.db)?;
+        let mut statements = String::new();
+        for suffix in SHADOW_SUFFIXES {
+            let old = format!("{}_{suffix}", self.table);
+            if table_exists(&connection, &self.database, &old)? {
+                statements.push_str(&format!(
+                    "ALTER TABLE {}.{} RENAME TO {};",
+                    quote(&self.database),
+                    quote(&old),
+                    quote(&format!("{new_name}_{suffix}")),
+                ));
+            }
+        }
+        connection.execute_batch(&statements)?;
+        self.table = new_name.to_owned();
+        self.names = shadow_names(&self.database, new_name);
         Ok(())
     }
 
     fn integrity(&self) -> Result<()> {
         let connection = connection(self.db)?;
+        let layout = detect_layout(&connection, &self.database, &self.table)?;
+        let metadata = self.metadata_table(layout);
         let loaded = read_index(
             &connection,
             &self.database,
-            &self.meta,
-            &self.chunks,
-            &self.chunks_table,
+            metadata,
+            &self.names.chunks,
+            &self.names.chunks_table,
         )?;
         let (dimensions, bit_width): (i64, i64) = connection.query_row(
-            &format!("SELECT dimensions, bit_width FROM {} WHERE id=1", self.meta),
+            &format!("SELECT dimensions, bit_width FROM {metadata} WHERE id=1"),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -1450,22 +1933,76 @@ impl TurboVecTable {
             .map_err(|_| error("invalid dimension in turbovec0 metadata"))?;
         let bit_width = usize::try_from(bit_width)
             .map_err(|_| error("invalid bit width in turbovec0 metadata"))?;
-        validate_geometry(&loaded.index, dimensions, bit_width)
+        validate_geometry(&loaded.index, dimensions, bit_width)?;
+        if layout == Layout::Legacy {
+            return Ok(());
+        }
+
+        let info = read_info(&connection, &self.names.info)?;
+        for (label, recorded, stored) in [
+            ("row count", info.row_count, loaded.index.len()),
+            ("delta byte count", info.delta_bytes, loaded.delta_bytes),
+            (
+                "delta operation count",
+                info.delta_operations,
+                loaded.delta_operations,
+            ),
+        ] {
+            if recorded != stored {
+                return Err(error(format!(
+                    "_info records {label} {recorded}; storage holds {stored}"
+                )));
+            }
+        }
+
+        // `_ids` changes with each statement but the chunks only at commit.
+        // Apply this connection's unwritten changes, so a check inside a
+        // write transaction compares like with like.
+        let mut expected: std::collections::HashSet<u64> = loaded.index.iter_ids().collect();
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| error("turbovec0 state lock is poisoned"))?;
+            if let Some(transaction) = state.transaction.as_ref() {
+                for change in &transaction.changes[transaction.synced_changes..] {
+                    match change {
+                        Change::Insert { id, .. } => {
+                            expected.insert(*id);
+                        }
+                        Change::Delete { id } => {
+                            expected.remove(id);
+                        }
+                    }
+                }
+            }
+        }
+        let stored = self.stored_ids()?;
+        let extra = stored.iter().find(|id| !expected.contains(id));
+        if stored.len() != expected.len() || extra.is_some() {
+            let missing = expected
+                .iter()
+                .filter(|id| stored.binary_search(id).is_err())
+                .min();
+            return Err(error(format!(
+                "{}_ids holds {} rowids and the index {}; first missing from _ids: {missing:?}, \
+                 first absent from the index: {extra:?}",
+                self.table,
+                stored.len(),
+                expected.len(),
+            )));
+        }
+        Ok(())
     }
 
     fn ensure_transaction(state: &mut State) -> &mut TransactionState {
-        let start_generation = state.generation;
-        let start_base_bytes = state.base_bytes;
-        let start_delta_bytes = state.delta_bytes;
-        let start_delta_operations = state.delta_operations;
-        state.transaction.get_or_insert_with(|| {
-            TransactionState::new(
-                start_generation,
-                start_base_bytes,
-                start_delta_bytes,
-                start_delta_operations,
-            )
-        })
+        if state.transaction.is_none() {
+            state.transaction = Some(TransactionState::start(state));
+        }
+        state
+            .transaction
+            .as_mut()
+            .expect("transaction started above")
     }
 
     fn ensure_destructive_checkpoint(state: &mut State) {
@@ -1481,10 +2018,10 @@ impl TurboVecTable {
                     .iter()
                     .any(|change| matches!(change, Change::Insert { vector: None, .. }))
         });
-        if !needs_checkpoint {
+        let Some(index) = state.index.as_ref().filter(|_| needs_checkpoint) else {
             return;
-        }
-        let payload = state.index.to_bytes();
+        };
+        let payload = index.to_bytes();
         let transaction = Self::ensure_transaction(state);
         transaction.destructive_checkpoint = Some(DestructiveCheckpoint {
             change_index: transaction.changes.len(),
@@ -1540,6 +2077,8 @@ impl TurboVecTable {
         Ok(())
     }
 
+    /// Return the in-memory state to an earlier point in the change list.
+    /// SQLite rolls `_ids` back itself.
     fn restore_to(&self, state: &mut State, change_index: usize) -> Result<()> {
         let mut transaction = state
             .transaction
@@ -1551,22 +2090,24 @@ impl TurboVecTable {
         }
 
         if let Some(checkpoint) = transaction.destructive_checkpoint.take() {
-            state.index = IdMapIndex::from_bytes(&checkpoint.payload)
+            let mut index = IdMapIndex::from_bytes(&checkpoint.payload)
                 .map_err(|cause| error(format!("cannot restore turbovec0 checkpoint: {cause}")))?;
             if change_index < checkpoint.change_index {
                 Self::undo_insert_prefix(
-                    &mut state.index,
+                    &mut index,
                     &transaction.changes[change_index..checkpoint.change_index],
                 )?;
             } else {
                 Self::replay(
-                    &mut state.index,
+                    &mut index,
                     &transaction.changes[checkpoint.change_index..change_index],
                 )?;
                 transaction.destructive_checkpoint = Some(checkpoint);
             }
+            state.index = Some(index);
         } else {
-            let tail_is_append_only = transaction.changes[change_index..].iter().all(|change| {
+            let tail = &transaction.changes[change_index..];
+            let tail_is_append_only = tail.iter().all(|change| {
                 matches!(
                     change,
                     Change::Insert {
@@ -1575,27 +2116,18 @@ impl TurboVecTable {
                     }
                 )
             });
-            if tail_is_append_only {
-                Self::undo_insert_prefix(&mut state.index, &transaction.changes[change_index..])?;
-            } else {
-                if transaction.synced_changes != 0 {
-                    state.transaction = Some(transaction);
-                    return Err(error("cannot roll back a turbovec0 savepoint after xSync"));
+            match state.index.as_mut() {
+                Some(index) if tail_is_append_only => Self::undo_insert_prefix(index, tail)?,
+                _ if tail.is_empty() => {}
+                _ => {
+                    if transaction.synced_changes != 0 {
+                        state.transaction = Some(transaction);
+                        return Err(error("cannot roll back a turbovec0 savepoint after xSync"));
+                    }
+                    // Drop the copy, if any. The next use rebuilds it from
+                    // committed storage and the retained prefix.
+                    state.index = None;
                 }
-                let connection = connection(self.db)?;
-                let loaded = read_index(
-                    &connection,
-                    &self.database,
-                    &self.meta,
-                    &self.chunks,
-                    &self.chunks_table,
-                )?;
-                if loaded.generation != transaction.start_generation {
-                    state.transaction = Some(transaction);
-                    return Err(error("turbovec0 changed while restoring a savepoint"));
-                }
-                state.index = loaded.index;
-                Self::replay(&mut state.index, &transaction.changes[..change_index])?;
             }
         }
         transaction.changes.truncate(change_index);
@@ -1608,10 +2140,17 @@ impl TurboVecTable {
     /// Row count for planner estimates. `try_lock` keeps xBestIndex off the
     /// blocking path: a cursor or a writer may hold the state lock, and a
     /// stalled planner is worse than a stale row count.
-    fn warm_len(&self) -> i64 {
+    fn estimated_rows(&self) -> i64 {
         self.state
             .try_lock()
-            .map_or(DEFAULT_ESTIMATED_ROWS, |state| state.index.len() as i64)
+            .ok()
+            .and_then(|state| match (&state.index, state.layout) {
+                (Some(index), _) => Some(index.len()),
+                (None, Layout::Current) => Some(state.row_count),
+                (None, Layout::Legacy) => None,
+            })
+            .and_then(|rows| i64::try_from(rows).ok())
+            .unwrap_or(DEFAULT_ESTIMATED_ROWS)
     }
 
     fn savepoint(&mut self, id: c_int) -> Result<()> {
@@ -1793,7 +2332,7 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
             // proportional to the index. Row count is not: it is the top-k the
             // caller asked for. Reporting a full scan's worth of rows made the
             // planner size joins around this table as if it returned millions.
-            let rows = self.warm_len();
+            let rows = self.estimated_rows();
             info.set_estimated_cost(rows as f64);
             info.set_estimated_rows(planned_k(k, limit).map_or(DEFAULT_KNN_ROWS, |k| k.min(rows)));
         } else if unusable_query {
@@ -1817,7 +2356,7 @@ unsafe impl<'vtab> VTab<'vtab> for TurboVecTable {
             info.set_estimated_rows(1);
         } else {
             info.set_idx_num(PLAN_FULL_SCAN);
-            let rows = self.warm_len();
+            let rows = self.estimated_rows();
             info.set_estimated_cost(rows as f64);
             info.set_estimated_rows(rows);
         }
@@ -1849,8 +2388,9 @@ impl CreateVTab<'_> for TurboVecTable {
     fn destroy(&self) -> Result<()> {
         let connection = connection(self.db)?;
         connection.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {}",
-            self.chunks, self.meta
+            "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {}; \
+             DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {}",
+            self.names.chunks, self.names.ids, self.names.info, self.names.meta
         ))
     }
 }
@@ -1861,22 +2401,24 @@ impl UpdateVTab<'_> for TurboVecTable {
             .as_i64()
             .map_err(|_| error("rowid must be a SQLite INTEGER"))?;
         let id = u64::try_from(id).map_err(|_| error("rowid must be non-negative"))?;
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        self.refresh(&mut state)?;
-        if !state.index.contains(id) {
+        let state = &mut *guard;
+        self.refresh(state)?;
+        let present = self.ensure_loaded(state)?.contains(id);
+        if state.layout == Layout::Current && self.remove_id(id)? != present {
+            return Err(self.ids_disagree(id));
+        }
+        if !present {
             return Err(error(format!("unknown turbovec0 rowid {id}")));
         }
-        Self::ensure_destructive_checkpoint(&mut state);
-        if !state.index.remove(id) {
+        Self::ensure_destructive_checkpoint(state);
+        if !state.index.as_mut().is_some_and(|index| index.remove(id)) {
             return Err(error(format!("unknown turbovec0 rowid {id}")));
         }
-        state
-            .transaction
-            .as_mut()
-            .expect("destructive checkpoint creates a transaction")
+        Self::ensure_transaction(state)
             .changes
             .push(Change::Delete { id });
         state.dirty = true;
@@ -1897,12 +2439,18 @@ impl UpdateVTab<'_> for TurboVecTable {
             )));
         }
         let conflict = unsafe { args.on_conflict(self.db) };
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        self.refresh(&mut state)?;
-        let exists = state.index.contains(id);
+        let state = &mut *guard;
+        self.refresh(state)?;
+        let exists = self.ensure_loaded(state)?.contains(id);
+        // Writes nothing when the rowid exists, so a refused insert leaves
+        // `_ids` as it was.
+        if state.layout == Layout::Current && self.add_id(id)? == exists {
+            return Err(self.ids_disagree(id));
+        }
         if exists && conflict != ConflictMode::Replace {
             return Err(sqlite_error(
                 ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -1910,13 +2458,15 @@ impl UpdateVTab<'_> for TurboVecTable {
             ));
         }
         if exists {
-            Self::ensure_destructive_checkpoint(&mut state);
-            state.index.remove(id);
+            Self::ensure_destructive_checkpoint(state);
         } else {
-            Self::ensure_transaction(&mut state);
+            Self::ensure_transaction(state);
         }
-        state
-            .index
+        let index = state.index.as_mut().expect("index loaded above");
+        if exists {
+            index.remove(id);
+        }
+        index
             .add_with_ids(&vector, &[id])
             .map_err(|cause| error(format!("cannot insert vector: {cause}")))?;
         // After the first delete or replacement every insert keeps its
@@ -1933,15 +2483,13 @@ impl UpdateVTab<'_> for TurboVecTable {
                         )
                     })
             });
-        let transaction = state
-            .transaction
-            .as_mut()
-            .expect("insert creates a transaction");
-        transaction.changes.push(Change::Insert {
-            id,
-            vector: retain_vector.then_some(vector),
-            replaces: exists,
-        });
+        Self::ensure_transaction(state)
+            .changes
+            .push(Change::Insert {
+                id,
+                vector: retain_vector.then_some(vector),
+                replaces: exists,
+            });
         state.dirty = true;
         Ok(rowid)
     }
@@ -2004,22 +2552,16 @@ impl TransactionVTab<'_> for TurboVecTable {
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
         self.refresh(&mut state)?;
-        if state.transaction.is_none() {
-            state.transaction = Some(TransactionState::new(
-                state.generation,
-                state.base_bytes,
-                state.delta_bytes,
-                state.delta_operations,
-            ));
-        }
+        Self::ensure_transaction(&mut state);
         Ok(())
     }
 
     fn sync(&mut self) -> Result<()> {
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
+        let state = &mut *guard;
         if !state.dirty {
             return Ok(());
         }
@@ -2035,11 +2577,27 @@ impl TransactionVTab<'_> for TurboVecTable {
         if synced_changes >= change_count {
             return Err(error("dirty turbovec0 state has no unsynced changes"));
         }
+        let connection = connection(self.db)?;
+        if state.layout == Layout::Legacy {
+            self.upgrade_storage(&connection, state)?;
+        }
         let pending = &state
             .transaction
             .as_ref()
             .expect("transaction checked above")
             .changes[synced_changes..];
+        let row_count = state
+            .row_count
+            .checked_add_signed(net_rows(pending))
+            .ok_or_else(|| error("turbovec0 row count is out of range"))?;
+        if let Some(index) = state.index.as_ref()
+            && index.len() != row_count
+        {
+            return Err(error(format!(
+                "turbovec0 index holds {} rows; its metadata and this transaction make {row_count}",
+                index.len()
+            )));
+        }
         let delta_len = delta_encoded_len(pending, self.dimensions)?;
         let next_delta_bytes = state
             .delta_bytes
@@ -2059,26 +2617,41 @@ impl TransactionVTab<'_> for TurboVecTable {
         let byte_limit = (state.base_bytes / 4)
             .max(MIN_COMPACTION_DELTA_BYTES)
             .min(state.base_bytes.max(MIN_DELTA_BASE_BYTES));
-        let operation_limit = (state.index.len() / 4).max(10_000);
+        let operation_limit = (row_count / 4).max(10_000);
         let compact = state.base_bytes < MIN_DELTA_BASE_BYTES
             || next_delta_bytes >= byte_limit
             || next_delta_operations >= operation_limit;
-        let connection = connection(self.db)?;
         if compact {
-            state.base_bytes = write_index(
+            // The only commit that needs the compressed codes.
+            let index = self.ensure_loaded(state)?;
+            let byte_len = write_index(
                 &connection,
                 &self.database,
-                &self.meta,
-                &self.chunks,
-                &self.chunks_table,
-                generation,
-                &state.index,
+                &self.names.chunks,
+                &self.names.chunks_table,
+                index,
             )?;
+            record_compaction(
+                &connection,
+                &self.names.info,
+                generation,
+                byte_len,
+                row_count,
+            )?;
+            state.base_bytes = byte_len;
             state.delta_bytes = 0;
             state.delta_operations = 0;
         } else {
             let blob = encode_delta(pending, self.dimensions)?;
-            write_delta(&connection, &self.meta, &self.chunks, generation, &blob)?;
+            write_delta(&connection, &self.names.chunks, generation, &blob)?;
+            record_delta(
+                &connection,
+                &self.names.info,
+                generation,
+                row_count,
+                next_delta_bytes,
+                next_delta_operations,
+            )?;
             state.delta_bytes = next_delta_bytes;
             state.delta_operations = next_delta_operations;
         }
@@ -2088,6 +2661,7 @@ impl TransactionVTab<'_> for TurboVecTable {
             .expect("transaction checked above")
             .synced_changes = change_count;
         state.generation = generation;
+        state.row_count = row_count;
         state.dirty = false;
         Ok(())
     }
@@ -2110,24 +2684,22 @@ impl TransactionVTab<'_> for TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        let Some(transaction) = state.transaction.as_ref() else {
-            state.dirty = false;
+        state.dirty = false;
+        let Some(transaction) = state.transaction.take() else {
             return Ok(());
         };
-        let start_generation = transaction.start_generation;
-        let start_base_bytes = transaction.start_base_bytes;
-        let start_delta_bytes = transaction.start_delta_bytes;
-        let start_delta_operations = transaction.start_delta_operations;
-        state.transaction = None;
-        state.generation = start_generation;
-        state.base_bytes = start_base_bytes;
-        state.delta_bytes = start_delta_bytes;
-        state.delta_operations = start_delta_operations;
+        state.generation = transaction.start_generation;
+        state.base_bytes = transaction.start_base_bytes;
+        state.delta_bytes = transaction.start_delta_bytes;
+        state.delta_operations = transaction.start_delta_operations;
+        state.row_count = transaction.start_row_count;
+        if transaction.upgraded {
+            state.layout = Layout::Legacy;
+        }
         // SQLite rolls shadow-table writes back around xRollback. Reload on
         // the next use, after that rollback is complete, instead of copying
         // the full index before every potentially destructive transaction.
-        state.needs_reload = true;
-        state.dirty = false;
+        state.index = None;
         Ok(())
     }
 }
@@ -2156,11 +2728,15 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
         table.refresh(&mut state)?;
 
         let rows = match plan & PLAN_KIND_MASK {
-            PLAN_FULL_SCAN => state.index.iter_ids().map(|id| (id, None)).collect(),
+            PLAN_FULL_SCAN => table
+                .ensure_loaded(&mut state)?
+                .iter_ids()
+                .map(|id| (id, None))
+                .collect(),
             PLAN_ROWID => {
                 let rowid: i64 = args.get(0)?;
                 if let Ok(id) = u64::try_from(rowid)
-                    && state.index.contains(id)
+                    && table.ensure_loaded(&mut state)?.contains(id)
                 {
                     vec![(id, None)]
                 } else {
@@ -2202,15 +2778,16 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
                 } else {
                     0
                 };
+                let index = table.ensure_loaded(&mut state)?;
                 let allowlist = if plan & PLAN_HAS_ROWID_FILTER != 0 {
                     let mut ids = Vec::new();
                     if plan & PLAN_ROWID_FILTER_IN != 0 {
                         append_in_values(current_filter_argument(argument)?, &mut ids)?;
-                        ids.retain(|id| state.index.contains(*id));
+                        ids.retain(|id| index.contains(*id));
                     } else {
                         let value: i64 = args.get(argument)?;
                         if let Ok(id) = u64::try_from(value)
-                            && state.index.contains(id)
+                            && index.contains(id)
                         {
                             ids.push(id);
                         }
@@ -2221,16 +2798,15 @@ unsafe impl VTabCursor for TurboVecCursor<'_> {
                 };
                 let limit_with_offset = limit
                     .map(|limit| limit.saturating_add(offset))
-                    .unwrap_or_else(|| state.index.len());
+                    .unwrap_or_else(|| index.len());
                 let k = hidden_k
                     .map(|k| k.min(limit_with_offset))
                     .unwrap_or(limit_with_offset)
-                    .min(state.index.len());
+                    .min(index.len());
                 if allowlist.as_ref().is_some_and(Vec::is_empty) {
                     return Ok(());
                 }
-                let results = state
-                    .index
+                let results = index
                     .try_search_with_allowlist(&query, k, allowlist.as_deref())
                     .map_err(|cause| error(format!("TurboVec search failed: {cause}")))?;
                 results
@@ -2298,12 +2874,37 @@ mod tests {
     #[test]
     fn quotes_shadow_table_names() {
         assert_eq!(quote("a\"b"), "\"a\"\"b\"");
-        assert_eq!(
-            names_str("main", "document_vectors"),
-            (
-                "\"main\".\"document_vectors_meta\"".to_owned(),
-                "\"main\".\"document_vectors_chunks\"".to_owned(),
-            )
-        );
+        let names = shadow_names("main", "document_vectors");
+        assert_eq!(names.meta, "\"main\".\"document_vectors_meta\"");
+        assert_eq!(names.info, "\"main\".\"document_vectors_info\"");
+        assert_eq!(names.ids, "\"main\".\"document_vectors_ids\"");
+        assert_eq!(names.chunks, "\"main\".\"document_vectors_chunks\"");
+        assert_eq!(names.chunks_table, "document_vectors_chunks");
+    }
+
+    #[test]
+    fn decodes_the_delta_marker_in_byte_lengths() {
+        assert_eq!(decode_byte_len(4096).unwrap(), (4096, false));
+        assert_eq!(decode_byte_len(-4097).unwrap(), (4096, true));
+        assert!(decode_byte_len(i64::MIN).is_err());
+    }
+
+    #[test]
+    fn counts_net_rows_across_replacements() {
+        let insert = |id, replaces| Change::Insert {
+            id,
+            vector: None,
+            replaces,
+        };
+        let changes = [
+            insert(1, false),
+            insert(2, true),
+            Change::Delete { id: 3 },
+            Change::Delete { id: 1 },
+            insert(1, false),
+        ];
+        assert_eq!(net_rows(&changes), 0);
+        assert_eq!(net_rows(&changes[..1]), 1);
+        assert_eq!(net_rows(&changes[2..4]), -2);
     }
 }

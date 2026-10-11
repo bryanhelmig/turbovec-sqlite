@@ -65,7 +65,7 @@ def main() -> None:
         append_commit_ms = (time.perf_counter() - begin) * 1000
         after_append_commit = rss()
         assert db.execute("select count(*) from v").fetchone()[0] == args.rows + 1
-        serialized_bytes = db.execute("select byte_len from v_meta").fetchone()[0]
+        serialized_bytes = db.execute("select byte_len from v_info").fetchone()[0]
         db.close()
     print(json.dumps({
         "extension": str(args.extension),
