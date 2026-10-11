@@ -105,6 +105,11 @@ def ignore_regression(extension: Path) -> None:
     assert outcomes[1] == (9, (0, 9), (2, 3)), outcomes
 
 
+def knn_query(dimensions: int) -> str:
+    query = "[" + ",".join(["1"] + ["0"] * (dimensions - 1)) + "]"
+    return f"select rowid from v where embedding match '{query}' and k=1"
+
+
 def corruption_worker(extension: Path, database: Path, query: str) -> None:
     if sys.platform != "win32":
         import resource
@@ -145,7 +150,8 @@ def corruption_regression(extension: Path) -> None:
             with sqlite3.connect(database) as db:
                 db.execute(mutation)
             db.close()
-            for query in ("select count(*) from v", "select turbovec_info('v')"):
+            # count(*) reads _ids, not the chunks; a search must load them.
+            for query in (knn_query(8), "select turbovec_info('v')"):
                 child = subprocess.run(
                     [sys.executable, str(Path(__file__).resolve()), str(extension),
                      "--corrupt-worker", str(database), query],
@@ -192,7 +198,7 @@ def corruption_regression(extension: Path) -> None:
                     str(extension),
                     "--corrupt-worker",
                     str(database),
-                    "select count(*) from v",
+                    knn_query(DIMENSIONS),
                 ],
                 capture_output=True,
                 text=True,

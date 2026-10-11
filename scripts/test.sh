@@ -160,7 +160,8 @@ cp "$database" "$format_database"
 format_error=$(
   "$sqlite_bin" "$format_database" \
     -cmd ".load $extension" \
-    "select count(*) from renamed_vectors" 2>&1 || true
+    "select rowid from renamed_vectors
+     where embedding match '[1,0,0,0,0,0,0,0]' and k=1" 2>&1 || true
 )
 if [[ "$format_error" != *"unsupported TurboVec format v7 revision 3"* ]] || \
    [[ "$format_error" != *"requires revision 2"* ]]

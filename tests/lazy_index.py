@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The _ids and _info shadow tables, and the upgrade from 0.2.0 storage."""
+"""Writes that skip the compressed index, and the upgrade from 0.2.0 storage."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from pathlib import Path
 
 
 DIMENSIONS = 768
+# Enough 4-bit rows for a two-chunk base over the 1 MiB floor below which
+# every commit compacts. Only above it can a commit skip the index.
 ROWS = 12_000
 BASE_VECTOR = struct.pack(f"<{DIMENSIONS}f", 1, *([0] * (DIMENSIONS - 1)))
 IDS = (
@@ -88,6 +90,151 @@ def expect_error(db: sqlite3.Connection, sql: str, params: tuple, fragment: str)
         assert fragment in str(cause), (fragment, str(cause))
     else:
         raise AssertionError(f"expected an error containing {fragment!r}: {sql}")
+
+
+def lazy_commit(extension: Path) -> None:
+    """A delete-and-insert transaction on a fresh connection reads no base chunk.
+
+    The base image's format header is damaged before the transaction. Loading
+    the base checks that header first, so any write that loaded it fails.
+    """
+    with tempfile.TemporaryDirectory(prefix="turbovec-lazy-") as directory:
+        database = Path(directory) / "lazy.db"
+        build(extension, database)
+        plain = connect(None, database)
+        chunk_count = plain.execute(
+            "select count(*) from v_chunks where chunk_id>=0"
+        ).fetchone()[0]
+        assert chunk_count >= 2, chunk_count
+        assert plain.execute("select count(*) from v_chunks where chunk_id<0").fetchone()[0] == 0
+        header = plain.execute(
+            "select substr(data,1,8) from v_chunks where chunk_id=0"
+        ).fetchone()[0]
+        plain.execute(
+            "update v_chunks set data=cast(x'00000000' || substr(data,5) as blob) where chunk_id=0"
+        )
+        plain.commit()
+
+        db = connect(extension, database)
+        # Rowid reads come from _ids.
+        assert db.execute("select count(*) from v").fetchone() == (ROWS,)
+        assert db.execute("select rowid from v where rowid=7").fetchall() == [(7,)]
+        assert db.execute("select rowid from v where rowid=?", (ROWS + 1,)).fetchall() == []
+        db.execute("begin immediate")
+        db.execute("delete from v where rowid=7")
+        db.execute("insert into v(rowid,embedding) values(7,?)", (unit(5),))
+        db.execute("insert or replace into v(rowid,embedding) values(8,?)", (unit(6),))
+        db.execute("insert into v(rowid,embedding) values(?,?)", (ROWS + 1, unit(7)))
+        db.execute("delete from v where rowid=9")
+        # The SQL contract holds without the index. SQLite finds no row to
+        # pass to xUpdate, as with 0.2.0.
+        db.execute("delete from v where rowid=9")
+        assert db.execute("select changes()").fetchone() == (0,)
+        try:
+            db.execute("insert into v(rowid,embedding) values(8,?)", (unit(9),))
+        except sqlite3.IntegrityError as cause:
+            assert cause.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, cause
+        else:
+            raise AssertionError("duplicate insert succeeded without the index")
+        db.execute("insert or ignore into v(rowid,embedding) values(8,?)", (unit(9),))
+        assert db.execute("select changes()").fetchone() == (0,)
+        assert db.execute("select count(*) from v").fetchone() == (ROWS,)
+        db.commit()
+
+        # The base is still damaged, so nothing rewrote it: the commit stored
+        # one delta batch.
+        assert plain.execute(
+            "select substr(data,1,4) from v_chunks where chunk_id=0"
+        ).fetchone() == (b"\0\0\0\0",)
+        assert plain.execute("select count(*) from v_chunks where chunk_id<0").fetchone() == (1,)
+        assert plain.execute(
+            "select row_count, delta_operations from v_info"
+        ).fetchone() == (ROWS, 5)
+        assert db.execute("select count(*) from v").fetchone() == (ROWS,)
+        assert db.execute(
+            "select rowid from v where rowid in (7,8,9,?) order by rowid", (ROWS + 1,)
+        ).fetchall() == [(7,), (8,), (ROWS + 1,)]
+        # A search does load the base, and refuses the damaged header.
+        expect_error(
+            db,
+            "select rowid from v where embedding match ? and k=1",
+            (unit(5),),
+            "unsupported TurboVec index format",
+        )
+        db.close()
+
+        plain.execute(
+            "update v_chunks set data=cast(? || substr(data,9) as blob) where chunk_id=0",
+            (header,),
+        )
+        plain.commit()
+        plain.close()
+        db = connect(extension, database)
+        assert nearest(db, unit(5))[0] == 7
+        assert nearest(db, unit(6))[0] == 8
+        assert nearest(db, unit(7))[0] == ROWS + 1
+        indexed = all_indexed(db)
+        assert 9 not in indexed and ROWS + 1 in indexed and len(indexed) == ROWS
+        assert stored_ids(db) == sorted(indexed)
+        assert db.execute("pragma integrity_check").fetchall() == [("ok",)]
+        db.close()
+
+
+def search_inside_transaction(extension: Path) -> None:
+    """A search after unloaded writes loads the index and replays them."""
+    with tempfile.TemporaryDirectory(prefix="turbovec-lazy-search-") as directory:
+        database = Path(directory) / "search.db"
+        build(extension, database)
+        db = connect(extension, database)
+        db.execute("begin immediate")
+        db.execute("delete from v where rowid=10")
+        db.execute("insert into v(rowid,embedding) values(?,?)", (ROWS + 2, unit(8)))
+        db.execute("insert or replace into v(rowid,embedding) values(11,?)", (unit(10),))
+        assert nearest(db, unit(8))[0] == ROWS + 2
+        assert nearest(db, unit(10))[0] == 11
+        assert db.execute(
+            "select rowid from v where embedding match ? and rowid in (10, 11) and k=5",
+            (BASE_VECTOR,),
+        ).fetchall() == [(11,)]
+        # Destructive savepoint rollback once the index is loaded.
+        db.execute("savepoint loaded")
+        db.execute("delete from v where rowid=?", (ROWS + 2,))
+        db.execute("insert into v(rowid,embedding) values(?,?)", (ROWS + 3, unit(9)))
+        db.execute("rollback to loaded")
+        db.execute("release loaded")
+        assert nearest(db, unit(8))[0] == ROWS + 2
+        assert nearest(db, unit(9))[0] != ROWS + 3
+        db.commit()
+        db.close()
+
+        # Savepoint rollback, then a search, while nothing is loaded yet.
+        db = connect(extension, database)
+        db.execute("begin immediate")
+        db.execute("savepoint unloaded")
+        db.execute("delete from v where rowid=12")
+        db.execute("insert into v(rowid,embedding) values(?,?)", (ROWS + 4, unit(11)))
+        db.execute("rollback to unloaded")
+        db.execute("insert into v(rowid,embedding) values(?,?)", (ROWS + 5, unit(12)))
+        assert db.execute(
+            "select rowid from v where rowid in (12, ?, ?) order by rowid", (ROWS + 4, ROWS + 5)
+        ).fetchall() == [(12,), (ROWS + 5,)]
+        assert nearest(db, unit(12))[0] == ROWS + 5
+        assert nearest(db, unit(11))[0] != ROWS + 4
+        db.commit()
+        # A full rollback of unloaded writes leaves storage and _ids alone.
+        db.execute("begin immediate")
+        db.execute("delete from v where rowid=13")
+        db.execute("insert into v(rowid,embedding) values(?,?)", (ROWS + 6, unit(13)))
+        db.rollback()
+        expected = (set(range(1, ROWS + 1)) - {10}) | {ROWS + 2, ROWS + 5}
+        assert set(stored_ids(db)) == expected
+        db.close()
+        db = connect(extension, database)
+        assert all_indexed(db) == expected
+        assert nearest(db, unit(8))[0] == ROWS + 2
+        assert nearest(db, unit(12))[0] == ROWS + 5
+        assert db.execute("pragma integrity_check").fetchall() == [("ok",)]
+        db.close()
 
 
 def downgrade(database: Path) -> None:
@@ -243,6 +390,10 @@ def main() -> None:
     args = parser.parse_args()
     extension = args.extension.resolve()
     legacy = args.legacy_extension.resolve() if args.legacy_extension else None
+    lazy_commit(extension)
+    print("turbovec0 unloaded commit passed")
+    search_inside_transaction(extension)
+    print("turbovec0 search after unloaded writes passed")
     upgrade(extension, legacy)
     print(
         "turbovec0 upgrade from 0.2.0 storage passed"

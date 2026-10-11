@@ -161,11 +161,20 @@ def main() -> None:
 
         for seed in range(args.seeds):
             rng = random.Random(0x5EED + seed)
+            # A fresh connection has not loaded the index. Above the 1 MiB
+            # base floor its writes go to _ids and the change list only.
+            if rng.randrange(3) == 0:
+                connection.close()
+                connection = connect(database, args.extension)
             before = dict(expected)
             savepoint: dict[int, int] | None = None
             touched: set[int] = set()
             connection.execute("begin immediate")
             for step in range(args.steps):
+                if rng.randrange(16) == 0:
+                    # Mid-transaction search: loads the index if needed and
+                    # replays the changes made so far.
+                    assert_ids(connection, expected, args.dimensions)
                 choice = rng.randrange(100)
                 rowid = rng.randrange(1, args.seeds * 4 + 65)
                 # Versions must not repeat across steps for one rowid, or a
