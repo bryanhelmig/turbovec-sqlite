@@ -160,6 +160,31 @@ def main() -> None:
     connection.execute("release early_point")
     connection.rollback()
 
+    # A replacement before the destructive checkpoint is not an append. 0.2.0
+    # undid it by removal and lost row 3 here.
+    connection.execute("begin immediate")
+    connection.execute(
+        "insert or replace into v(rowid, embedding) values (1, ?)", (VECTOR_X,)
+    )
+    connection.execute("savepoint replaced_point")
+    connection.execute(
+        "insert or replace into v(rowid, embedding) values (3, ?)", (VECTOR_NEG_X,)
+    )
+    connection.execute(
+        "insert into v(rowid, embedding) values (40, ?)", (VECTOR_X,)
+    )
+    connection.execute("delete from v where rowid=1")
+    connection.execute("rollback to replaced_point")
+    assert ids(connection) == [1, 3]
+    best_y = connection.execute(
+        "select rowid from v where embedding match ? order by score desc limit 1",
+        (VECTOR_Y,),
+    ).fetchone()
+    assert best_y == (3,)
+    connection.execute("release replaced_point")
+    connection.commit()
+    assert ids(connection) == [1, 3]
+
     # Ordinary LIMIT is only valid for nearest-first ordering. Accepting an
     # ascending or unordered LIMIT would rank only a truncated candidate set.
     invalid_queries = (

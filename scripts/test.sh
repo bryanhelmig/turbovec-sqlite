@@ -82,9 +82,11 @@ then
   done
   python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/storage.py "$extension"
-  python3 -X faulthandler tests/model_check.py "$extension" --seeds 20 --steps 20
+  # 20 seeds of 20 steps missed a lost-replacement rollback that 300 of 30
+  # reproduce in about a second.
+  python3 -X faulthandler tests/model_check.py "$extension" --seeds 300 --steps 30
   python3 -X faulthandler tests/model_check.py "$extension" \
-    --seeds 10 --steps 20 --dimensions 512 --initial-rows 5000
+    --seeds 60 --steps 30 --dimensions 512 --initial-rows 5000
   python3 -X faulthandler tests/recall_fixture.py "$extension"
   python3 -X faulthandler tests/savepoint_cost.py "$extension"
 else
