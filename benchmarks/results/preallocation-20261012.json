@@ -1,0 +1,228 @@
+{
+  "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+  "cpu_count": 8,
+  "python": "3.14.7",
+  "sqlite": "3.53.4",
+  "threads": 8,
+  "page_cache": "warm",
+  "rows": 1000000,
+  "dimensions": 1536,
+  "base_bytes": 781666515,
+  "database_sha256": "5e4c960e49bbfd121a7bce5f3edbc2fefcef9bad56c8493a5ae620b083c88702",
+  "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b",
+  "extension_sha256": {
+    "baseline": "73228151ba56bfb258f4f70585f8006b3913a511a5f8557c0fb2303b4d2ffbbb",
+    "preallocated": "828229e84658ccc1ef3a56dd546ad0d9a51202981feeea3e85e6e55c658c44d1"
+  },
+  "command": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "benchmarks/load_index.py",
+    "--extension",
+    "target/release/libturbovec_sqlite.dylib",
+    "--baseline-extension",
+    "target/preallocation/baseline.dylib",
+    "--database",
+    "target/preallocation/base-1000000x1536.db",
+    "--repeat",
+    "10",
+    "--json",
+    "benchmarks/results/preallocation-20261012.json"
+  ],
+  "order": [
+    "baseline",
+    "preallocated",
+    "preallocated",
+    "baseline",
+    "baseline",
+    "preallocated",
+    "preallocated",
+    "baseline",
+    "baseline",
+    "preallocated",
+    "preallocated",
+    "baseline",
+    "baseline",
+    "preallocated",
+    "preallocated",
+    "baseline",
+    "baseline",
+    "preallocated",
+    "preallocated",
+    "baseline"
+  ],
+  "warmups": {
+    "baseline": {
+      "first_search_ms": 429.0581250024843,
+      "warm_search_ms_median": 14.65454199933447,
+      "rss_before_bytes": 28164096,
+      "peak_rss_bytes": 837812224,
+      "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+    },
+    "preallocated": {
+      "first_search_ms": 444.7457089991076,
+      "warm_search_ms_median": 14.458583005762193,
+      "rss_before_bytes": 28262400,
+      "peak_rss_bytes": 822542336,
+      "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+    }
+  },
+  "results": {
+    "baseline": {
+      "first_search_ms_median": 429.5664380006201,
+      "warm_search_ms_median": 15.088603999174666,
+      "peak_rss_mib_median": 798.8125,
+      "samples": [
+        {
+          "first_search_ms": 430.1679170021089,
+          "warm_search_ms_median": 16.24495799478609,
+          "rss_before_bytes": 27820032,
+          "peak_rss_bytes": 837468160,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 431.2119169990183,
+          "warm_search_ms_median": 15.04525000200374,
+          "rss_before_bytes": 28147712,
+          "peak_rss_bytes": 837648384,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 426.46550000063144,
+          "warm_search_ms_median": 15.420292002090719,
+          "rss_before_bytes": 28131328,
+          "peak_rss_bytes": 837582848,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 432.9342089986312,
+          "warm_search_ms_median": 14.82337500056019,
+          "rss_before_bytes": 28082176,
+          "peak_rss_bytes": 837648384,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 428.7522079976043,
+          "warm_search_ms_median": 15.13195799634559,
+          "rss_before_bytes": 27852800,
+          "peak_rss_bytes": 837582848,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 428.96495899913134,
+          "warm_search_ms_median": 14.503416998195462,
+          "rss_before_bytes": 27934720,
+          "peak_rss_bytes": 837484544,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 428.0618749980931,
+          "warm_search_ms_median": 14.703250002639834,
+          "rss_before_bytes": 27852800,
+          "peak_rss_bytes": 837533696,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 432.3687920041266,
+          "warm_search_ms_median": 15.463957999600098,
+          "rss_before_bytes": 28065792,
+          "peak_rss_bytes": 837648384,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 431.38224999711383,
+          "warm_search_ms_median": 14.38758299627807,
+          "rss_before_bytes": 28131328,
+          "peak_rss_bytes": 837746688,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 427.3371669987682,
+          "warm_search_ms_median": 15.89120899734553,
+          "rss_before_bytes": 28164096,
+          "peak_rss_bytes": 837697536,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        }
+      ]
+    },
+    "preallocated": {
+      "first_search_ms_median": 427.03029200129095,
+      "warm_search_ms_median": 14.608396002586232,
+      "peak_rss_mib_median": 784.265625,
+      "samples": [
+        {
+          "first_search_ms": 425.3496669989545,
+          "warm_search_ms_median": 14.795249997405335,
+          "rss_before_bytes": 28180480,
+          "peak_rss_bytes": 822312960,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 426.15029199805576,
+          "warm_search_ms_median": 14.658125001005828,
+          "rss_before_bytes": 27869184,
+          "peak_rss_bytes": 822018048,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 426.6556669972488,
+          "warm_search_ms_median": 14.558667004166637,
+          "rss_before_bytes": 28164096,
+          "peak_rss_bytes": 822460416,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 427.4049170053331,
+          "warm_search_ms_median": 14.32924999971874,
+          "rss_before_bytes": 28114944,
+          "peak_rss_bytes": 822296576,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 432.27945800026646,
+          "warm_search_ms_median": 14.496916999632958,
+          "rss_before_bytes": 28164096,
+          "peak_rss_bytes": 822444032,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 428.1670829950599,
+          "warm_search_ms_median": 14.531584005453624,
+          "rss_before_bytes": 27983872,
+          "peak_rss_bytes": 822198272,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 426.13683299714467,
+          "warm_search_ms_median": 15.00345800013747,
+          "rss_before_bytes": 28147712,
+          "peak_rss_bytes": 822411264,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 429.55849999998463,
+          "warm_search_ms_median": 14.435499993851408,
+          "rss_before_bytes": 27836416,
+          "peak_rss_bytes": 822099968,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 431.80725000274833,
+          "warm_search_ms_median": 15.153332999034319,
+          "rss_before_bytes": 28262400,
+          "peak_rss_bytes": 822444032,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        },
+        {
+          "first_search_ms": 425.6497499955003,
+          "warm_search_ms_median": 15.993000000889879,
+          "rss_before_bytes": 28213248,
+          "peak_rss_bytes": 822476800,
+          "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+        }
+      ]
+    }
+  },
+  "baseline_commit": "703f2541a34059788f32e6eacff050c36f01c4ef",
+  "candidate": "baseline plus ChunkReader::read_to_end preallocation; measured before the version-only bump to 0.3.1",
+  "rust": "rustc 1.89.0 (29483883e 2025-08-04)"
+}

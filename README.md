@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.3.0
+version=0.3.1
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.3.0-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.3.1-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -145,7 +145,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.3.0
+-- 0.3.1
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,

@@ -858,6 +858,17 @@ impl<'a> ChunkReader<'a> {
 }
 
 impl Read for ChunkReader<'_> {
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        // TurboVec calls this with its own empty buffer. The chunk geometry
+        // has already been validated, so reserve the image once without
+        // materializing a second copy or trusting unchecked metadata.
+        let remaining = self.remaining;
+        buf.try_reserve_exact(remaining).map_err(io::Error::other)?;
+        // Take uses the standard reader loop and stops at the known length;
+        // calling read_to_end on self here would recurse into this override.
+        self.take(remaining as u64).read_to_end(buf)
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // An empty destination must not be mistaken for end-of-chunk, or it
         // would skip a chunk without reading it.
@@ -2230,16 +2241,23 @@ impl TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        let change_index = state
-            .transaction
-            .as_ref()
-            .ok_or_else(|| error("turbovec0 has no active transaction"))?
-            .savepoints
-            .iter()
-            .rev()
-            .find(|(existing, _)| *existing == id)
-            .map(|(_, change_index)| *change_index)
-            .ok_or_else(|| error(format!("unknown turbovec0 savepoint {id}")))?;
+        // A SAVEPOINT that opens the transaction has no xSavepoint callback.
+        // SQLite rolls it back with -1, meaning the transaction's beginning,
+        // while keeping the transaction open for more writes or rollbacks.
+        let change_index = if id == -1 {
+            0
+        } else {
+            state
+                .transaction
+                .as_ref()
+                .ok_or_else(|| error("turbovec0 has no active transaction"))?
+                .savepoints
+                .iter()
+                .rev()
+                .find(|(existing, _)| *existing == id)
+                .map(|(_, change_index)| *change_index)
+                .ok_or_else(|| error(format!("unknown turbovec0 savepoint {id}")))?
+        };
         self.restore_to(&mut state, change_index)?;
         state
             .transaction

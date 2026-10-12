@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.1 — 2026-10-12
+
+- Reserve the validated base-image size before reading SQLite chunks into
+  TurboVec's loader. The loader still reads and holds the entire index. On an
+  Apple M1 with a warm page cache, a 745 MiB base used 784.3 MiB peak process
+  RSS instead of 798.8 MiB; first-search time was effectively unchanged
+  (427.0 versus 429.6 ms, ten fresh processes per variant). Query IDs and scores
+  matched exactly. TurboVec remains pinned to 1.0.0; disk format and SQL API
+  are unchanged.
+- Fix `ROLLBACK TO` when `SAVEPOINT` opened the transaction without a preceding
+  `BEGIN`. SQLite identifies that rollback with -1, which the extension
+  incorrectly rejected as an unknown savepoint. It now restores the initial
+  rows and vectors, drops nested savepoints, and keeps the outer transaction
+  usable for repeated rollback and a later commit. Tests cover loaded and
+  unloaded indexes on both sides of the destructive-checkpoint size threshold.
+
 ## 0.3.0 — 2026-10-11
 
 - Commit inserts and deletes without loading the compressed index. A new
