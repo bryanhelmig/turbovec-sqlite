@@ -83,7 +83,11 @@ then
   done
   python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/savepoints.py "$extension"
-  python3 -X faulthandler tests/upstream_upgrade.py "$extension"
+  upstream_baseline_args=()
+  if [[ "${UPSTREAM_BASELINE_RELEASE:-0}" == "1" ]]; then
+    upstream_baseline_args+=(--baseline-release)
+  fi
+  python3 -X faulthandler tests/upstream_upgrade.py "$extension" "${upstream_baseline_args[@]}"
   python3 -X faulthandler tests/storage.py "$extension"
   # LEGACY_EXTENSION may name a 0.2.0 build; without it the upgrade test
   # simulates 0.2.0 storage and cannot check that 0.2.0 refuses the result.

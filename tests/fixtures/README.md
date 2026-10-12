@@ -36,3 +36,12 @@ python3 tests/upstream_upgrade.py /path/to/0.3.1/libturbovec_sqlite.dylib --gene
 CI reads the frozen fixtures using the new extension and verifies rollback,
 delta replay, old WAL snapshots, compaction to v8, scalar writes, reopening,
 and integrity. These are regression inputs, not a consumer migration tool.
+
+CI passes `--baseline-release`, downloads the native 0.3.1 archive, verifies
+its pinned SHA-256, and queries each frozen database in a separate process.
+The new engine must exactly match those same-CPU results before the upgrade;
+subsequent rollback and compaction checks retain exact scores. Offline runs
+check the frozen IDs and permit a 0.005 cross-CPU quantized-score difference.
+Use `--baseline-extension /path/to/0.3.1/library` for the exact check offline.
+Connections close even after a failed assertion so Windows reports the
+original failure instead of a locked-file cleanup error.
