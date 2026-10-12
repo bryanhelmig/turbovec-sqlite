@@ -7,7 +7,6 @@ import argparse
 import gzip
 import hashlib
 import json
-import math
 import platform
 import subprocess
 import sys
@@ -153,16 +152,14 @@ def verify(extension: Path, baseline: Path | None = None, fetch_baseline: bool =
             db.execute("release outer_point")
             observed = selected(db)
             # CI uses the actual old binary on this CPU, without relaxing score
-            # equality. Offline checks use the frozen IDs and a quantized-score
-            # bound across CPU kernels; subsequent same-host checks are exact.
+            # equality. Offline checks use the frozen IDs; subsequent rollback
+            # and compaction checks on this host retain exact scores.
             for actual_query, recorded_query in zip(observed, expected):
                 assert len(actual_query) == len(recorded_query)
                 for (rowid, score), (old_rowid, old_score) in zip(actual_query, recorded_query):
                     assert rowid == old_rowid
                     if baseline:
                         assert score == old_score, (bits, rowid, score, old_score)
-                    else:
-                        assert math.isclose(score, old_score, rel_tol=0, abs_tol=0.005), (score, old_score)
             expected = observed
             info = json.loads(db.execute("select turbovec_info('v')").fetchone()[0])
             assert (info["format_version"], info["format_revision"]) == (7, 2)

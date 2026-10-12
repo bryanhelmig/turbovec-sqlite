@@ -41,7 +41,7 @@ CI passes `--baseline-release`, downloads the native 0.3.1 archive, verifies
 its pinned SHA-256, and queries each frozen database in a separate process.
 The new engine must exactly match those same-CPU results before the upgrade;
 subsequent rollback and compaction checks retain exact scores. Offline runs
-check the frozen IDs and permit a 0.005 cross-CPU quantized-score difference.
+check the frozen IDs and retain the first read's scores through compaction.
 Use `--baseline-extension /path/to/0.3.1/library` for the exact check offline.
 Connections close even after a failed assertion so Windows reports the
 original failure instead of a locked-file cleanup error.
