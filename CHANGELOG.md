@@ -15,6 +15,12 @@
   recall. This is a corpus-specific result, not a guarantee. Peak process RSS
   increased by 7.8 MiB at 2 bits and 9.7 MiB at 4 bits; first search was
   slightly slower. Reproduction scripts and raw samples are checked in.
+- On the existing 745 MiB v7 synthetic index (one million vectors), warm
+  search fell from 14.8 to 3.8 ms, but peak process RSS rose from 784 to
+  969 MiB and first search from 427 to 495 ms. Full-scan mode retains
+  approximately the old loading and memory behavior. This larger follow-up
+  makes the search-speed versus memory tradeoff explicit; it is not a recall
+  test on the consumer's own embeddings.
 - Read existing v7 revision 2 indexes directly and write v8 revision 1. No
   re-embedding or migration tool is needed. Normal compaction updates the base;
   scalar BLOB writes also produce v8. SQLite schema and delta records are

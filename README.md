@@ -307,6 +307,12 @@ RSS rose from 71.9 to 81.6 MiB. These results do not guarantee identical
 candidates or the same speedup on another corpus. See the
 [upstream comparison](docs/PERFORMANCE_EXPERIMENTS.md#turbovec-112--october-12-2026).
 
+On the existing 745 MiB synthetic index (one million vectors), warm search
+fell from 14.8 to 3.8 ms, while peak process RSS rose from 784 to 969 MiB and
+first search from 427 to 495 ms. Full-scan mode retained the old loading and
+memory behavior. Choose the default for search speed when that memory cost
+is acceptable; measure your own workload before deciding.
+
 To retain full compressed scanning, set `TURBOVEC_2BIT_PLANES=0` and
 `TURBOVEC_4BIT_PLANES=0` before starting the application. This still uses
 quantized scores; it does not make ranking exact against source float32 vectors.

@@ -376,3 +376,37 @@ python3 -m venv /tmp/turbovec-upstream-bench
 The benchmark launches each engine in its own process. For the full-scan
 variant it sets `TURBOVEC_2BIT_PLANES=0` and `TURBOVEC_4BIT_PLANES=0` before
 startup. It does not download data during normal CI.
+
+### Loading an existing 745 MiB v7 index
+
+A follow-up uses the original 1,000,000-row, 1,536-dimensional, 4-bit
+synthetic database from the preallocation experiment. Both engines read the
+same unchanged v7 revision 2 file. This measures an existing consumer's first
+search and memory peak; the sparse synthetic vectors do not establish recall
+on real embeddings.
+
+Five alternating fresh processes per engine on the same Apple M1, after one
+warmup each, gave:
+
+| Mode | First search | Warm search | Peak process RSS |
+|---|---:|---:|---:|
+| 0.3.1 | 427.2 ms | 14.79 ms | 784.3 MiB |
+| 0.4.0 | 495.0 ms | 3.81 ms | 968.9 MiB |
+| 0.4.0 full scan | 430.6 ms | 14.75 ms | 784.3 MiB |
+
+The default upgrade is about 3.9x faster for warm search, but uses an
+additional 185 MiB of peak process memory and takes about 16% longer for its
+first search on this v7 file. It is a search-speed tradeoff, not a memory
+optimization. The full-scan control was measured separately in five fresh
+processes with both `TURBOVEC_2BIT_PLANES=0` and `TURBOVEC_4BIT_PLANES=0`;
+it retains approximately the old loading and memory behavior.
+
+Every sampled query has the same result digest, including IDs and scores,
+and the database SHA-256 is unchanged. The run uses eight Rayon threads and a
+warm OS page cache. Raw per-process measurements and input/binary hashes are in
+[upstream-1.1.2-million-load-20261012.json](../benchmarks/results/upstream-1.1.2-million-load-20261012.json).
+Reproduce with `benchmarks/load_index.py`, passing 0.3.1 as
+`--baseline-extension`, 0.4.0 as `--extension`, the original database as
+`--database`, and `--repeat 5 --threads 8`. That script's historical
+`preallocated` label denotes the candidate binary. For the full-scan control,
+set both environment variables to zero before launching it.

@@ -1,0 +1,156 @@
+{
+  "database_sha256": "5e4c960e49bbfd121a7bce5f3edbc2fefcef9bad56c8493a5ae620b083c88702",
+  "rows": 1000000,
+  "dimensions": 1536,
+  "threads": 8,
+  "page_cache": "warm",
+  "synthetic": true,
+  "input_format": "v7 revision 2",
+  "samples": {
+    "0.3.1": [
+      {
+        "first_search_ms": 429.93420899438206,
+        "warm_search_ms_median": 14.844207995338365,
+        "rss_before_bytes": 28082176,
+        "peak_rss_bytes": 822362112,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 431.09212499985006,
+        "warm_search_ms_median": 15.370915993116796,
+        "rss_before_bytes": 28213248,
+        "peak_rss_bytes": 822378496,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 427.2353749984177,
+        "warm_search_ms_median": 14.507874991977587,
+        "rss_before_bytes": 27852800,
+        "peak_rss_bytes": 822083584,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 425.82070900243707,
+        "warm_search_ms_median": 14.78929199220147,
+        "rss_before_bytes": 28246016,
+        "peak_rss_bytes": 822525952,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 427.1981659985613,
+        "warm_search_ms_median": 14.665041991975158,
+        "rss_before_bytes": 27836416,
+        "peak_rss_bytes": 822116352,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      }
+    ],
+    "0.4.0": [
+      {
+        "first_search_ms": 497.87229200592265,
+        "warm_search_ms_median": 3.812333001405932,
+        "rss_before_bytes": 28082176,
+        "peak_rss_bytes": 1015922688,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 492.61212500277907,
+        "warm_search_ms_median": 3.8286669878289104,
+        "rss_before_bytes": 28196864,
+        "peak_rss_bytes": 1016070144,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 493.660958003602,
+        "warm_search_ms_median": 3.7831670051673427,
+        "rss_before_bytes": 28180480,
+        "peak_rss_bytes": 1016217600,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 495.6535839883145,
+        "warm_search_ms_median": 3.8004579982953146,
+        "rss_before_bytes": 27836416,
+        "peak_rss_bytes": 1015709696,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 495.005000004312,
+        "warm_search_ms_median": 3.831166002782993,
+        "rss_before_bytes": 28164096,
+        "peak_rss_bytes": 1015922688,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      }
+    ],
+    "0.4.0_classic": [
+      {
+        "first_search_ms": 432.97208299918566,
+        "warm_search_ms_median": 17.971875000512227,
+        "rss_before_bytes": 28164096,
+        "peak_rss_bytes": 822427648,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 430.5770829960238,
+        "warm_search_ms_median": 14.748250003322028,
+        "rss_before_bytes": 28180480,
+        "peak_rss_bytes": 822493184,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 433.6589169979561,
+        "warm_search_ms_median": 14.97412500611972,
+        "rss_before_bytes": 27869184,
+        "peak_rss_bytes": 822181888,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 425.6686250009807,
+        "warm_search_ms_median": 14.36558400746435,
+        "rss_before_bytes": 28262400,
+        "peak_rss_bytes": 822542336,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      },
+      {
+        "first_search_ms": 426.74479199922644,
+        "warm_search_ms_median": 14.344124996569008,
+        "rss_before_bytes": 28147712,
+        "peak_rss_bytes": 822362112,
+        "result_sha256": "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      }
+    ]
+  },
+  "results": {
+    "0.3.1": {
+      "first_search_ms": 427.2353749984177,
+      "warm_search_ms": 14.78929199220147,
+      "peak_rss_mib": 784.265625,
+      "result_digests": [
+        "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      ],
+      "extension_sha256": "62afa2da53b204f60e18e84dd3cc0b9e6222c00231d982446c9080b32debed42"
+    },
+    "0.4.0": {
+      "first_search_ms": 495.005000004312,
+      "warm_search_ms": 3.812333001405932,
+      "peak_rss_mib": 968.859375,
+      "result_digests": [
+        "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      ],
+      "extension_sha256": "9e513e8f84f70436fa14fc767cc4a7c44f25bb42832e712d44d2eb5e5c5ce95e"
+    },
+    "0.4.0_classic": {
+      "first_search_ms": 430.5770829960238,
+      "warm_search_ms": 14.748250003322028,
+      "peak_rss_mib": 784.328125,
+      "result_digests": [
+        "dcaf1bd8ac1ee26d3e13f88d3f151a71e8a5ef29da122de7ac452cc278ffde4b"
+      ],
+      "extension_sha256": "9e513e8f84f70436fa14fc767cc4a7c44f25bb42832e712d44d2eb5e5c5ce95e"
+    }
+  },
+  "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+  "python": "3.14.7",
+  "sqlite": "3.53.4",
+  "cpu": "Apple M1",
+  "method": "benchmarks/load_index.py run_child; one warmup then five alternating samples per baseline/default variant; classic measured separately with five fresh processes and both TURBOVEC_*BIT_PLANES=0"
+}
