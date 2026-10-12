@@ -2241,16 +2241,23 @@ impl TurboVecTable {
             .state
             .lock()
             .map_err(|_| error("turbovec0 state lock is poisoned"))?;
-        let change_index = state
-            .transaction
-            .as_ref()
-            .ok_or_else(|| error("turbovec0 has no active transaction"))?
-            .savepoints
-            .iter()
-            .rev()
-            .find(|(existing, _)| *existing == id)
-            .map(|(_, change_index)| *change_index)
-            .ok_or_else(|| error(format!("unknown turbovec0 savepoint {id}")))?;
+        // A SAVEPOINT that opens the transaction has no xSavepoint callback.
+        // SQLite rolls it back with -1, meaning the transaction's beginning,
+        // while keeping the transaction open for more writes or rollbacks.
+        let change_index = if id == -1 {
+            0
+        } else {
+            state
+                .transaction
+                .as_ref()
+                .ok_or_else(|| error("turbovec0 has no active transaction"))?
+                .savepoints
+                .iter()
+                .rev()
+                .find(|(existing, _)| *existing == id)
+                .map(|(_, change_index)| *change_index)
+                .ok_or_else(|| error(format!("unknown turbovec0 savepoint {id}")))?
+        };
         self.restore_to(&mut state, change_index)?;
         state
             .transaction

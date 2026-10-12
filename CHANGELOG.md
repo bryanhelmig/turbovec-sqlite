@@ -7,8 +7,14 @@
   Apple M1 with a warm page cache, a 745 MiB base used 784.3 MiB peak process
   RSS instead of 798.8 MiB; first-search time was effectively unchanged
   (427.0 versus 429.6 ms, ten fresh processes per variant). Query IDs and scores
-  matched exactly. TurboVec remains pinned to 1.0.0; disk format, SQL API, and
-  transaction behavior are unchanged.
+  matched exactly. TurboVec remains pinned to 1.0.0; disk format and SQL API
+  are unchanged.
+- Fix `ROLLBACK TO` when `SAVEPOINT` opened the transaction without a preceding
+  `BEGIN`. SQLite identifies that rollback with -1, which the extension
+  incorrectly rejected as an unknown savepoint. It now restores the initial
+  rows and vectors, drops nested savepoints, and keeps the outer transaction
+  usable for repeated rollback and a later commit. Tests cover loaded and
+  unloaded indexes on both sides of the destructive-checkpoint size threshold.
 
 ## 0.3.0 — 2026-10-11
 
