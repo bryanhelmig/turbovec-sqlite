@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 — 2026-10-12
+
+- Reserve the validated base-image size before reading SQLite chunks into
+  TurboVec's loader. The loader still reads and holds the entire index. On an
+  Apple M1 with a warm page cache, a 745 MiB base used 784.3 MiB peak process
+  RSS instead of 798.8 MiB; first-search time was effectively unchanged
+  (427.0 versus 429.6 ms, ten fresh processes per variant). Query IDs and scores
+  matched exactly. TurboVec remains pinned to 1.0.0; disk format, SQL API, and
+  transaction behavior are unchanged.
+
 ## 0.3.0 — 2026-10-11
 
 - Commit inserts and deletes without loading the compressed index. A new

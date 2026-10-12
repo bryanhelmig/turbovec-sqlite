@@ -268,3 +268,46 @@ released implementation it spent 1.27 seconds committing and wrote 514 MiB,
 so complete serialization and WAL I/O still dominated. The candidate spent
 45.5 ms mutating, 0.7 ms committing, and wrote 72 KiB. The isolated result does
 not justify tuning for the one heavily loaded 9-second observation.
+
+## Preallocate the index read buffer — October 12, 2026
+
+`ChunkReader::read_to_end` reserves the validated base-image byte count in
+TurboVec's own buffer, then uses the standard bounded read loop. This avoids
+growing the buffer while reading, retains fallible allocation, and does not
+introduce a second whole-image copy. TurboVec stays at 1.0.0.
+
+The baseline is 0.3.0 (`703f254`); the candidate differs in the reader method
+only. Both were built with Rust 1.89.0 in release mode. Ten fresh processes per
+variant read the same 1,000,000-row, 1,536-dimensional, 4-bit database on an
+Apple M1, using eight Rayon threads and a warm OS page cache. One unmeasured
+warmup per variant precedes alternating baseline/candidate order. Each process
+runs one first search and nine warm queries. Inputs are deterministic sparse
+vectors, not a recall dataset. Raw samples, binary/input hashes, query-result
+hash, and command are in
+[preallocation-20261012.json](../benchmarks/results/preallocation-20261012.json).
+
+| Measurement | 0.3.0 | Preallocated |
+|---|---:|---:|
+| First search, median | 429.6 ms | 427.0 ms |
+| Peak process RSS, median | 798.8 MiB | 784.3 MiB |
+| Warm search, median of process medians | 15.1 ms | 14.6 ms |
+
+The retained benefit is a small, consistent 14.5 MiB reduction in peak RSS
+(1.8%). The first-search difference is 0.6%, below the 5% noise threshold; no
+speed improvement is claimed. Every query's rowids and scores match exactly,
+and the database hash is unchanged. RSS includes Python and SQLite and differs
+from the earlier fresh-commit run; compare variants within this experiment.
+Preallocation still reads and holds the entire 745 MiB base. It does not give
+a searching process the small footprint of an index-free commit.
+
+Reproduce with:
+
+```sh
+python3 benchmarks/load_index.py \
+  --extension /path/to/candidate/libturbovec_sqlite.dylib \
+  --baseline-extension /path/to/0.3.0/libturbovec_sqlite.dylib \
+  --database /tmp/turbovec-load/base-1000000x1536.db \
+  --repeat 10 --threads 8 --json /tmp/turbovec-load.json
+```
+
+The script builds the fixture with the baseline if the database does not exist.
