@@ -23,9 +23,9 @@ use rusqlite::{Connection, Error, Result};
 use turbovec::IdMapIndex;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const TURBOVEC_FORMAT_MAGIC: &[u8; 4] = b"TV7\0";
-const TURBOVEC_FORMAT_VERSION: u8 = 7;
-const TURBOVEC_FORMAT_REVISION: u8 = 2;
+const TURBOVEC_FORMAT_MAGIC: &[u8; 4] = b"TV8\0";
+const TURBOVEC_FORMAT_VERSION: u8 = 8;
+const TURBOVEC_FORMAT_REVISION: u8 = 1;
 const MODULE_NAME: &CStr = c"turbovec_knn";
 
 const COL_ID: c_int = 0;
@@ -106,23 +106,36 @@ fn vector_blob(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
-fn check_format(bytes: &[u8]) -> std::result::Result<(), String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IndexFormat {
+    version: u8,
+    revision: u8,
+}
+
+fn check_format(bytes: &[u8]) -> std::result::Result<IndexFormat, String> {
     let Some(header) = bytes.get(..5) else {
         return Err("TurboVec index is too short to contain a format header".to_owned());
     };
-    if &header[..4] != TURBOVEC_FORMAT_MAGIC {
-        return Err(
-            "unsupported TurboVec index format; this extension requires format v7".to_owned(),
-        );
-    }
-    if header[4] != TURBOVEC_FORMAT_REVISION {
+    let (version, revision) = match &header[..4] {
+        b"TV7\0" => (7, 2),
+        magic if magic == TURBOVEC_FORMAT_MAGIC => {
+            (TURBOVEC_FORMAT_VERSION, TURBOVEC_FORMAT_REVISION)
+        }
+        _ => {
+            return Err(
+                "unsupported TurboVec index format; this extension requires format v7 or v8"
+                    .to_owned(),
+            );
+        }
+    };
+    if header[4] != revision {
         return Err(format!(
-            "unsupported TurboVec format v{TURBOVEC_FORMAT_VERSION} revision {}; \
-             this extension requires revision {TURBOVEC_FORMAT_REVISION}",
+            "unsupported TurboVec format v{version} revision {}; \
+             this extension requires revision {revision}",
             header[4]
         ));
     }
-    Ok(())
+    Ok(IndexFormat { version, revision })
 }
 
 fn load_index(bytes: &[u8]) -> Result<IdMapIndex> {
@@ -546,7 +559,21 @@ mod tests {
         let mut newer = bytes;
         newer[4] = TURBOVEC_FORMAT_REVISION + 1;
         let message = check_format(&newer).unwrap_err();
-        assert!(message.contains("unsupported TurboVec format v7 revision 3"));
-        assert!(message.contains("requires revision 2"));
+        assert!(message.contains("unsupported TurboVec format v8 revision 2"));
+        assert!(message.contains("requires revision 1"));
+        assert_eq!(
+            check_format(b"TV7\0\x02").unwrap(),
+            IndexFormat {
+                version: 7,
+                revision: 2
+            }
+        );
+        assert!(
+            check_format(b"TV7\0\x03")
+                .unwrap_err()
+                .contains("v7 revision 3")
+        );
+        assert!(check_format(b"TV9\0\x01").is_err());
+        assert!(check_format(b"TV8\0").is_err());
     }
 }

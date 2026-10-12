@@ -5,6 +5,11 @@ This benchmark compares the loadable extensions through the same Python
 official `sqlite-vec` v0.1.9 release (`e9f598abfa0c06b328d8fe5da9c3760cce74be10`)
 and verifies the platform archive against its published SHA-256 checksum.
 
+For the 0.3.1 → 0.4.0 engine comparison, see the
+[TurboVec 1.1.2 experiment](PERFORMANCE_EXPERIMENTS.md#turbovec-112--october-12-2026).
+It uses 36,000 real embeddings and 256 held-out queries, including 2/4-bit
+search, filtered search, full-scan controls, memory, and recall.
+
 ## Run it
 
 For the fixed moderate-scale factory score:

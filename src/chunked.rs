@@ -21,7 +21,7 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error, OptionalExtension, Result, Statement, params};
 use turbovec::IdMapIndex;
 
-use crate::{TURBOVEC_FORMAT_REVISION, TURBOVEC_FORMAT_VERSION, check_format, parse_vector};
+use crate::{IndexFormat, check_format, parse_vector};
 
 const MODULE_NAME: &CStr = c"turbovec0";
 /// Shadow tables a `turbovec0` table may own. `meta` is the 0.2.0 metadata
@@ -835,15 +835,15 @@ impl<'a> ChunkReader<'a> {
     /// The format gate has to run before any bytes reach TurboVec's loader, so
     /// read the header off the first chunk and rewind. `reopen` resets the read
     /// position, which makes the rewind free.
-    fn check_format(&mut self) -> Result<()> {
+    fn check_format(&mut self) -> Result<IndexFormat> {
         let mut header = [0_u8; 5];
         self.blob.read_exact(&mut header).map_err(|_| {
             error("cannot open turbovec0 index: TurboVec index is too short to contain a format header")
         })?;
-        check_format(&header)
+        let format = check_format(&header)
             .map_err(|cause| error(format!("cannot open turbovec0 index: {cause}")))?;
         self.blob.reopen(0)?;
-        Ok(())
+        Ok(format)
     }
 
     /// Chunk lengths were validated before this reader opened. Re-check each
@@ -894,6 +894,7 @@ impl Read for ChunkReader<'_> {
 }
 
 struct LoadedIndex {
+    format: IndexFormat,
     generation: i64,
     index: IdMapIndex,
     base_bytes: usize,
@@ -1036,7 +1037,7 @@ fn read_index(
         validate_chunks(connection, meta, chunks)?;
     let mut reader =
         ChunkReader::open(connection, database, chunks_table, chunk_count, base_bytes)?;
-    reader.check_format()?;
+    let format = reader.check_format()?;
     let mut index = IdMapIndex::load_from_reader(&mut reader)
         .map_err(|cause| error(format!("invalid chunked TurboVec index: {cause}")))?;
     if reader.remaining != 0 {
@@ -1095,6 +1096,7 @@ fn read_index(
         _ => {}
     }
     Ok(LoadedIndex {
+        format,
         generation,
         index,
         base_bytes,
@@ -1156,8 +1158,8 @@ pub(crate) fn table_info(connection: &Connection, qualified_table: &str) -> Resu
         "base_bytes": loaded.base_bytes,
         "delta_bytes": loaded.delta_bytes,
         "delta_operations": loaded.delta_operations,
-        "format_version": TURBOVEC_FORMAT_VERSION,
-        "format_revision": TURBOVEC_FORMAT_REVISION,
+        "format_version": loaded.format.version,
+        "format_revision": loaded.format.revision,
     })
     .to_string())
 }

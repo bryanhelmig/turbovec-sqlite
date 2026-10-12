@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.3.1
+version=0.4.0
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.3.1-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.4.0-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -145,13 +145,13 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.3.1
+-- 0.4.0
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
 --  "bit_width":4,"dimensions":1536,"serialized_bytes":...,
 --  "base_bytes":...,"delta_bytes":...,"delta_operations":...,
---  "format_version":7,"format_revision":2}
+--  "format_version":8,"format_revision":1}
 ```
 
 Applications can parse `turbovec_version()` at connection setup and fail fast
@@ -293,9 +293,23 @@ generic entry-point symbol so it cannot collide with another static extension.
 
 ## Search quality and tradeoffs
 
-TurboVec uses a compressed exhaustive scan, not a graph. Every eligible vector
-is scored, but the stored score is quantized. This avoids graph construction
-and corpus-specific training, at the cost of imperfect recall.
+TurboVec normalizes and compresses vectors into 2-, 3-, or 4-bit codes. With
+upstream 1.1.2, eligible large 2- and 4-bit indexes use staged search: scan a
+coarse representation, refine a shortlist, then score the finalists. Both
+quantization and candidate selection can affect recall. Smaller indexes,
+3-bit indexes, and unsupported CPU/dimension combinations use a full compressed
+scan. Neither route needs graph construction or corpus-specific training.
+
+On an Apple M1, 0.4.0 searched 36,000 real OpenAI embeddings at 4 bits in
+0.233 ms versus 0.733 ms for 0.3.1 (k=10). All 256 held-out queries returned
+the same IDs and scores in this test, with recall@10 of 0.964. Peak process
+RSS rose from 71.9 to 81.6 MiB. These results do not guarantee identical
+candidates or the same speedup on another corpus. See the
+[upstream comparison](docs/PERFORMANCE_EXPERIMENTS.md#turbovec-112--october-12-2026).
+
+To retain full compressed scanning, set `TURBOVEC_2BIT_PLANES=0` and
+`TURBOVEC_4BIT_PLANES=0` before starting the application. This still uses
+quantized scores; it does not make ranking exact against source float32 vectors.
 
 One production-shaped integration measured OpenAI `text-embedding-3-small` at
 370,000 vectors: **0.93 recall@10 and 0.96 recall@40** with 4-bit codes. The
@@ -303,7 +317,7 @@ checked-in GloVe gate currently measures **0.907 recall@10 and 0.922
 recall@40** over 4,096 index vectors and 128 held-out queries. These are useful
 reference points, not guarantees for a different embedding distribution.
 
-The repeatable synthetic comparison on an Apple M1 uses 10,000 normalized
+The earlier synthetic comparison on an Apple M1 uses 10,000 normalized
 1,536-dimensional vectors:
 
 | Engine | Database | Query p50 | Recall@10 |
@@ -327,18 +341,24 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and base disk format are separate. The base image is TurboVec
-format v7, revision 2, and the delta records are unchanged since 0.1.6. 0.3.0
-adds two shadow tables, `<name>_info` and `<name>_ids`, so that writes
-need not load the compressed index. It opens a 0.2.0 index without a rebuild,
-and the first commit that writes to it upgrades it in place. The upgrade is
-one-way: 0.2.0 then refuses the index, reporting "Query returned no rows",
-including a 0.2.0 connection that was already open. Move every process that
-opens the database to 0.3.0 before the first write. Versions before 0.1.6 refuse an
-index while delta records are present. During 0.x, a release may intentionally
-break disk compatibility and will say so in the changelog. The extension checks
-the header before deserialization and refuses another format or revision with a
-specific error. Keep a recoverable copy of source embeddings.
+The crate version and base disk format are separate. 0.4.0 writes TurboVec
+format v8 revision 1 and reads both v7 revision 2 and v8 revision 1. The SQLite
+shadow-table schema and delta records are unchanged from 0.3.x.
+
+To upgrade a 0.3.x consumer, back up the database with SQLite's backup API (or
+copy it after a clean shutdown and WAL checkpoint), replace the extension,
+and restart every process that opens that database. Existing indexes open
+directly: no re-embedding or migration tool is needed. Normal compaction writes
+the base as v8; small delta commits can leave it at v7. Scalar BLOB mutations
+also write v8. `turbovec_info()` reports the actual base format. Older 0.3.x
+extensions cannot read v8, so keep all processes on 0.4.0 once upgraded; use the
+backup if reverting.
+
+The earlier 0.2.0 layout still upgrades on its first write by creating `_info`
+and `_ids` and emptying `_meta`. That transition is also one-way: 0.2.0 refuses
+the upgraded database. During 0.x, intentional disk compatibility changes are
+listed in the changelog. The extension validates supported headers before
+deserialization. Keep a recoverable copy of source embeddings.
 
 ## Development
 
