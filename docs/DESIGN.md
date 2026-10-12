@@ -2,10 +2,14 @@
 
 ## The core idea
 
-TurboVec is a compressed exhaustive index, not a graph index. It normalizes and
-rotates vectors, quantizes each coordinate to 2, 3, or 4 bits, and arranges codes
-in 32-vector blocks for SIMD scoring. Search still considers every eligible
-vector. Approximation comes from compressed scoring, not candidate pruning.
+TurboVec normalizes and rotates vectors, quantizes each coordinate to 2, 3,
+or 4 bits, and arranges codes in 32-vector blocks for SIMD scoring. Upstream
+1.1.2 defaults to staged search for eligible 2- and 4-bit indexes of at least
+32,768 vectors: a sign-plane scan builds a shortlist, later stages refine it,
+and finalists receive the full compressed score. Approximation comes from both
+quantization and candidate pruning. The classic full compressed scan remains
+available and is the fallback for smaller indexes, 3 bits, and unsupported
+CPU/dimension combinations.
 
 TurboVec also supports TQ+ coordinate calibration. The current `turbovec0`
 table is uncalibrated; adding calibration requires an explicit lifecycle for
@@ -44,12 +48,13 @@ reports it as the plan's row count so surrounding joins are sized correctly.
 SQLite presents `IN` to `xBestIndex` as an equality constraint. The module uses
 SQLite's all-at-once IN API to receive the complete rowid set in one cursor
 call, drops IDs without vectors, and hands the remaining IDs to `IdMapIndex`.
-This computes the exact top-k within the allowed set under TurboVec's compressed
-score. A post-filtered fixed overfetch cannot make that guarantee.
+Search selects candidates within the allowed set, so disallowed rows cannot
+consume the shortlist. Staged search can still miss a higher-scoring allowed
+row; the classic route computes exact top-k under the compressed score.
 
 Allowlist speed depends on physical locality. Clustered IDs leave whole
 32-vector blocks empty and can avoid most scoring. Widely scattered IDs may
-touch nearly every block, so the exact filtered query can cost as much as a
+touch nearly every block, so the filtered query can cost as much as a
 full compressed scan plus selection. Correctness does not depend on locality.
 
 ## Persistence
@@ -172,7 +177,7 @@ It supports trained Faiss structures, but the project now points users toward
 `sqlite-vec`. `sqlite-vec` is dependency-free C, stores vectors and mappings in
 chunked shadow tables, and runs its own exhaustive distance scan.
 
-TurboVec's SQLite shape is closer to `sqlite-vec`: exhaustive scan and
+TurboVec's SQLite shape is closer to `sqlite-vec`: block scanning and
 SQLite-owned chunk storage. Its differentiator is aggressively compressed,
 rotated codes and architecture-specific SIMD kernels, with quality controlled
 by bit width.
@@ -193,8 +198,12 @@ by bit width.
 - The build produces native dynamic and static libraries per OS/architecture.
   SQLite's stable extension ABI avoids tying the loadable library to one SQLite
   release.
-- The extension pins TurboVec disk format v7 revision 2 independently of the
-  crate version. Load rejects another magic or revision before deserialization.
+- The extension writes v8 revision 1 and reads v7 revision 2 as well.
+  Load rejects another magic or revision before deserialization, and
+  `turbovec_info()` reports the actual persisted base header. A delta-only
+  commit retains that header; a compaction writes v8. The scalar BLOB writer
+  also writes v8. These use upstream's native readers and writer, with no
+  separate conversion framework in the SQLite extension.
 
 Rusqlite 0.40 does not expose savepoint, shadow-name, or integrity module
 callbacks through its builder. This crate pins 0.40.2 and locally fills those

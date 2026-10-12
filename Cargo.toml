@@ -1,6 +1,6 @@
 [package]
 name = "turbovec-sqlite"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Experimental TurboVec loadable extension for SQLite"
@@ -28,7 +28,7 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["blob", 
 serde_json = "1"
 # Pin the vector engine so an upstream format or API change requires an
 # explicit compatibility review in this extension.
-turbovec = "=1.0.0"
+turbovec = "=1.1.2"
 
 [dev-dependencies]
 rayon = "1.12"

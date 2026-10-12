@@ -83,6 +83,11 @@ then
   done
   python3 -X faulthandler tests/allowlist.py "$extension"
   python3 -X faulthandler tests/savepoints.py "$extension"
+  upstream_baseline_args=()
+  if [[ "${UPSTREAM_BASELINE_RELEASE:-0}" == "1" ]]; then
+    upstream_baseline_args+=(--baseline-release)
+  fi
+  python3 -X faulthandler tests/upstream_upgrade.py "$extension" "${upstream_baseline_args[@]}"
   python3 -X faulthandler tests/storage.py "$extension"
   # LEGACY_EXTENSION may name a 0.2.0 build; without it the upgrade test
   # simulates 0.2.0 storage and cannot check that 0.2.0 refuses the result.
@@ -156,7 +161,7 @@ format_database="$test_dir/newer-format.db"
 cp "$database" "$format_database"
 "$sqlite_bin" "$format_database" \
   "update renamed_vectors_chunks
-     set data=cast(substr(data, 1, 4) || x'03' || substr(data, 6) as blob)
+     set data=cast(substr(data, 1, 4) || x'02' || substr(data, 6) as blob)
    where chunk_id=0;
    update renamed_vectors_info set generation=generation+1;"
 format_error=$(
@@ -165,8 +170,8 @@ format_error=$(
     "select rowid from renamed_vectors
      where embedding match '[1,0,0,0,0,0,0,0]' and k=1" 2>&1 || true
 )
-if [[ "$format_error" != *"unsupported TurboVec format v7 revision 3"* ]] || \
-   [[ "$format_error" != *"requires revision 2"* ]]
+if [[ "$format_error" != *"unsupported TurboVec format v8 revision 2"* ]] || \
+   [[ "$format_error" != *"requires revision 1"* ]]
 then
   echo "Expected a clear newer-format refusal, got: $format_error" >&2
   exit 1

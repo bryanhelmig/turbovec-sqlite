@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0 — 2026-10-12
+
+- Upgrade the pinned TurboVec dependency from 1.0.0 to 1.1.2. Eligible large
+  2- and 4-bit indexes now use staged search, including upstream's filtered
+  search fixes and its correction for recall on bunched embeddings. Candidate
+  IDs can differ from the full scan; retained IDs use the same compressed
+  scores. Set `TURBOVEC_2BIT_PLANES=0` and `TURBOVEC_4BIT_PLANES=0` before
+  starting the application to keep full compressed scanning.
+- On an Apple M1 with 36,000 public OpenAI embeddings and 256 held-out queries,
+  4-bit k=10 search fell from 0.733 to 0.233 ms (3.15x), and 10%-filtered
+  search from 1.158 to 0.641 ms (1.81x). The 2-bit gains were smaller
+  (1.12–1.26x). All measured IDs and scores matched 0.3.1, with unchanged
+  recall. This is a corpus-specific result, not a guarantee. Peak process RSS
+  increased by 7.8 MiB at 2 bits and 9.7 MiB at 4 bits; first search was
+  slightly slower. Reproduction scripts and raw samples are checked in.
+- Read existing v7 revision 2 indexes directly and write v8 revision 1. No
+  re-embedding or migration tool is needed. Normal compaction updates the base;
+  scalar BLOB writes also produce v8. SQLite schema and delta records are
+  unchanged. `turbovec_info()` reports the actual base format, including v7
+  before compaction. Back up the database and update every process before
+  writing; older 0.3.x extensions cannot read v8. Use the backup to revert.
+- Add frozen 0.3.1 database fixtures covering 2/3/4-bit delta replay, rollback,
+  scalar BLOBs, WAL snapshots, compaction to v8, and reopening. Keep the
+  SAVEPOINT fix and loader preallocation from 0.3.1.
+
 ## 0.3.1 — 2026-10-12
 
 - Reserve the validated base-image size before reading SQLite chunks into

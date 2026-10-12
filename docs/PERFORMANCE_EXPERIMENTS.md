@@ -311,3 +311,68 @@ python3 benchmarks/load_index.py \
 ```
 
 The script builds the fixture with the baseline if the database does not exist.
+
+## TurboVec 1.1.2 — October 12, 2026
+
+0.4.0 upgrades the engine from 1.0.0 to 1.1.2. Its staged search uses a coarse
+scan, shortlist refinement, and full compressed scoring of finalists. This
+changes candidate selection as well as performance. The comparison uses the
+first 36,000 embeddings from the pinned public
+[Qdrant DBpedia OpenAI 1536-dimensional dataset](https://huggingface.co/datasets/Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M/tree/4a9731217921bc476a0f03544f11f22ae4903fa5),
+with the next 256 rows held out as queries. Vectors are L2-normalized float32.
+This corpus crosses the 32,768-vector staged-search threshold; the smaller
+GloVe CI fixture does not.
+
+The Apple M1 run used Rust 1.89.0 release builds, eight Rayon threads, a warm
+OS page cache, and five fresh processes per variant in alternating order after
+one unmeasured process. Each variant builds its own database from the same
+vectors. Query times are medians of process medians. The filtered case permits
+every tenth row through SQLite's `rowid IN` allowlist. Exact float32 neighbors
+are computed outside the timed processes. Raw samples, dataset and binary
+hashes, result digests, and the exact command are in
+[upstream-1.1.2-20261012.json](../benchmarks/results/upstream-1.1.2-20261012.json).
+
+| Bits | Query | 0.3.1 | 0.4.0 default | 0.4.0 full scan | Speedup | Recall, all variants |
+|---|---|---:|---:|---:|---:|---:|
+| 2 | k=10 | 0.351 ms | 0.281 ms | 0.312 ms | 1.25x | 0.8914 |
+| 2 | k=40 | 0.400 ms | 0.317 ms | 0.355 ms | 1.26x | 0.9032 |
+| 2 | 10% filter, k=10 | 0.757 ms | 0.677 ms | 0.715 ms | 1.12x | 0.8941 |
+| 4 | k=10 | 0.733 ms | 0.233 ms | 0.714 ms | 3.15x | 0.9641 |
+| 4 | k=40 | 0.782 ms | 0.284 ms | 0.750 ms | 2.76x | 0.9722 |
+| 4 | 10% filter, k=10 | 1.158 ms | 0.641 ms | 1.142 ms | 1.81x | 0.9609 |
+
+Every measured query returned identical IDs and scores across the three
+variants. Staged search does not guarantee this on another corpus. The test
+also requires deterministic repeats, correct allowlist membership, equal scores
+for shared IDs, and recall no more than 0.005 below the baseline. The upstream
+1.1.2 fix targets bunched embeddings; this OpenAI corpus is not a validation of
+that distinct distribution or of IDX's private queries.
+
+Memory and first-search cost moved in the other direction:
+
+| Bits | First search, 0.3.1 → 0.4.0 | Peak process RSS, 0.3.1 → 0.4.0 |
+|---|---:|---:|
+| 2 | 30.37 → 31.20 ms | 58.58 → 66.38 MiB |
+| 4 | 98.94 → 101.26 ms | 71.89 → 81.56 MiB |
+
+The full-scan mode's memory and first-search cost stayed near 0.3.1. These
+process peaks include Python, NumPy, and SQLite; compare within this run.
+The new engine still reads and holds the whole index. The benefit here is warm
+search speed, not lower memory or faster initial loading.
+
+Reproduce (the fetch downloads one 350 MiB shard and verifies its SHA-256):
+
+```sh
+python3 -m venv /tmp/turbovec-upstream-bench
+/tmp/turbovec-upstream-bench/bin/pip install numpy==2.5.4 pyarrow==26.0.0
+/tmp/turbovec-upstream-bench/bin/python benchmarks/fetch_upstream_fixture.py /tmp/turbovec-real
+/tmp/turbovec-upstream-bench/bin/python benchmarks/upstream_search.py \
+  --extension /path/to/0.4.0/libturbovec_sqlite.dylib \
+  --baseline-extension /path/to/0.3.1/libturbovec_sqlite.dylib \
+  --data-dir /tmp/turbovec-real --workdir /tmp/turbovec-upstream-search \
+  --repeat 5 --threads 8 --json /tmp/turbovec-upstream.json
+```
+
+The benchmark launches each engine in its own process. For the full-scan
+variant it sets `TURBOVEC_2BIT_PLANES=0` and `TURBOVEC_4BIT_PLANES=0` before
+startup. It does not download data during normal CI.
