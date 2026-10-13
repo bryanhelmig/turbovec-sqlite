@@ -31,6 +31,8 @@ def main() -> None:
         package = f"turbovec-sqlite-{version}-{target}"
         archive = args.directory / f"{package}.tar.gz"
         expected_hash, filename = Path(str(archive) + ".sha256").read_text().split()
+        # GNU sha256sum uses '*' for binary mode (the Windows default).
+        filename = filename.removeprefix("*")
         if filename != archive.name:
             raise ValueError(f"checksum names the wrong archive: {filename}")
         with archive.open("rb") as stream:
