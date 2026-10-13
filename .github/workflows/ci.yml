@@ -174,9 +174,9 @@ jobs:
           TRANSACTION_TEST_REPETITIONS: ${{ runner.os == 'Windows' && '5' || '1' }}
         run: ./scripts/test.sh
 
-      - name: Run native Rust tests
+      - name: Run native Rust tests with release optimizations
         shell: bash
-        run: cargo test --all-targets --locked
+        run: cargo test --release --all-targets --locked
 
       - name: Test static linking
         if: runner.os != 'Windows'
