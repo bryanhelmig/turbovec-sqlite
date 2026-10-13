@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1 — 2026-10-13
+
+- Update `crc32fast` from 1.5.0 to 1.5.2. The new release changes ARM and
+  x86 checksum kernels, including wider SIMD on supported x86 CPUs. Persisted
+  checksums remain IEEE CRC-32. Add independent reference checks across short
+  inputs, alignment offsets, and the kernel size thresholds. SQL behavior,
+  TurboVec 1.1.2, index formats, and the staged-search memory tradeoff are
+  unchanged; no database migration is needed. This is a dependency maintenance
+  release, with no claimed end-to-end speed improvement.
+- Update the pinned GitHub Actions for artifact upload (7.0.2), download
+  (8.0.2), and Node setup (7.1.0). Exercise these in the full manual workflow,
+  including downloading all five platform archives and checking their file
+  coverage, SHA-256 checksums, and required package contents before release.
+
 ## 0.4.0 — 2026-10-12
 
 - Upgrade the pinned TurboVec dependency from 1.0.0 to 1.1.2. Eligible large
