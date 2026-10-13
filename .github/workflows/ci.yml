@@ -174,9 +174,9 @@ jobs:
           TRANSACTION_TEST_REPETITIONS: ${{ runner.os == 'Windows' && '5' || '1' }}
         run: ./scripts/test.sh
 
-      - name: Run native Rust tests
+      - name: Run native Rust tests with release optimizations
         shell: bash
-        run: cargo test --all-targets --locked
+        run: cargo test --release --all-targets --locked
 
       - name: Test static linking
         if: runner.os != 'Windows'
@@ -209,7 +209,7 @@ jobs:
         shell: bash
         run: ./scripts/package.sh
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: turbovec-sqlite-${{ matrix.target }}
           path: |
@@ -231,7 +231,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
 
@@ -252,10 +252,29 @@ jobs:
       - name: Run host-language examples
         run: ./scripts/test_clients.sh
 
+  verify-artifacts:
+    name: Verify downloaded release archives
+    if: startsWith(github.ref, 'refs/tags/sqlite-v') || github.event_name == 'workflow_dispatch'
+    needs: [build-and-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify platform coverage, checksums, and package contents
+        run: python3 scripts/verify_archives.py release-assets
+
   release:
     name: Publish tagged archives
     if: startsWith(github.ref, 'refs/tags/sqlite-v')
-    needs: [quality, sqlite-compatibility, build-and-smoke, client-examples]
+    needs: [quality, sqlite-compatibility, build-and-smoke, client-examples, verify-artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -271,7 +290,7 @@ jobs:
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
           test "$GITHUB_REF_NAME" = "sqlite-v$version"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: release-assets
           merge-multiple: true

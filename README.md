@@ -19,7 +19,7 @@ Release archives contain the loadable library, static library, C header,
 examples, license notices, and SHA-256 checksum:
 
 ```sh
-version=0.4.0
+version=0.4.1
 asset=turbovec-sqlite-$version-macos-aarch64.tar.gz
 base=https://github.com/bryanhelmig/turbovec-sqlite/releases/download/sqlite-v$version
 curl -fLO "$base/$asset"
@@ -35,7 +35,7 @@ Load the dynamic library in SQLite. SQLite supplies the platform suffix when
 it is omitted:
 
 ```sql
-.load ./turbovec-sqlite-0.4.0-macos-aarch64/libturbovec_sqlite
+.load ./turbovec-sqlite-0.4.1-macos-aarch64/libturbovec_sqlite
 select turbovec_version();
 ```
 
@@ -145,7 +145,7 @@ Inspect the loaded build and one index:
 
 ```sql
 select turbovec_version();
--- 0.4.0
+-- 0.4.1
 
 select json(turbovec_info('document_vectors'));
 -- {"table":"document_vectors","generation":1,"count":370000,
@@ -347,7 +347,7 @@ when exact ranking is required.
 - Content rows and source vectors remain application-owned.
 - Rowids must be explicit, unique, non-negative SQLite integers.
 
-The crate version and base disk format are separate. 0.4.0 writes TurboVec
+The crate version and base disk format are separate. 0.4.x writes TurboVec
 format v8 revision 1 and reads both v7 revision 2 and v8 revision 1. The SQLite
 shadow-table schema and delta records are unchanged from 0.3.x.
 
@@ -357,7 +357,7 @@ and restart every process that opens that database. Existing indexes open
 directly: no re-embedding or migration tool is needed. Normal compaction writes
 the base as v8; small delta commits can leave it at v7. Scalar BLOB mutations
 also write v8. `turbovec_info()` reports the actual base format. Older 0.3.x
-extensions cannot read v8, so keep all processes on 0.4.0 once upgraded; use the
+extensions cannot read v8, so keep all processes on 0.4.x once upgraded; use the
 backup if reverting.
 
 The earlier 0.2.0 layout still upgrades on its first write by creating `_info`
