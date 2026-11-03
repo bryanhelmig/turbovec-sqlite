@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2 — 2026-11-03
+
+- Update `serde_json` from 1.0.151 to 1.0.154. The parser now reports
+  invalid UTF-8 at the first bad byte in JSON input.
+
 ## 0.4.1 — 2026-10-13
 
 - Update `crc32fast` from 1.5.0 to 1.5.2. The new release changes ARM and
